@@ -1,0 +1,195 @@
+version: 1
+score_alignment: encounter_anchor  # encounter_anchor or wall_clock
+score_interval_hours: 4
+min_points: 4
+unit_autofix: true
+
+columns:
+  required:
+    - patient_id
+    - encounter_id
+    - timestamp
+  optional_numeric:
+    - MAP
+    - HR
+    - RR
+    - SpO2
+    - FiO2
+    - noradrenaline_mcgkgmin
+    - adrenaline_mcgkgmin
+    - dobutamine_mcgkgmin
+    - milrinone_mcgkgmin
+    - urine_output_ml_30min
+    - chest_drain_ml_30min
+    - lactate
+    - haemoglobin_gL
+    - creatinine_umolL
+    - WCC_10e9L
+    - temperature_C
+    - RASS
+  optional_categorical:
+    - oxygen_device
+    - arterial_line_present
+    - central_line_present
+    - insulin_infusion
+    - pacing_active
+    - imaging_summary
+
+outcomes_columns:
+  required:
+    - patient_id
+    - encounter_id
+    - icu_discharge_time
+  adverse_event:
+    - ADVERSE_EVENT
+  component_flags:
+    - readmitted_within_48h
+    - MET_call_within_48h
+    - pressor_restart_48h
+    - reintubation_or_NIV_escalation_48h
+    - death_48h
+  optional:
+    - planned_readmission_48h
+    - no_stepdown
+    - reason_no_stepdown
+
+plausible_ranges:
+  MAP: [20, 140]
+  HR: [20, 220]
+  RR: [4, 80]
+  SpO2: [40, 100]
+  FiO2: [0.21, 1.0]
+  noradrenaline_mcgkgmin: [0, 5]
+  adrenaline_mcgkgmin: [0, 5]
+  dobutamine_mcgkgmin: [0, 20]
+  milrinone_mcgkgmin: [0, 2]
+  urine_output_ml_30min: [0, 1000]
+  chest_drain_ml_30min: [0, 1000]
+  lactate: [0, 20]
+  haemoglobin_gL: [40, 200]
+  creatinine_umolL: [20, 1200]
+  WCC_10e9L: [0.1, 200]
+  temperature_C: [30, 45]
+  RASS: [-5, 4]
+
+oxygen_device_map:
+  ETT: 5
+  NIV: 4
+  HFNC: 3
+  Venturi: 2
+  Mask: 2
+  NC: 1
+  RA: 0
+  # synonyms
+  ET_TUBE: 5
+  INTUBATED: 5
+  BIPAP: 4
+  CPAP: 4
+  HI_FLOW: 3
+  VENTURI_MASK: 2
+  SIMPLE_MASK: 2
+  NASAL_CANNULA: 1
+  ROOM_AIR: 0
+
+windows_hours:
+  vitals: 4
+  drains_short: 4
+  drains_long: 8
+  labs_long: 24
+  hb_delta: 6
+
+thresholds:
+  green_iri: 70
+  amber_iri: 50
+  max_lactate_age_for_green: 8
+  max_hb_age_for_green: 12
+  max_creatinine_age_for_green: 24
+  max_wcc_age_for_green: 24
+  oliguria_threshold_ml_per_4h: 200
+
+hard_stops:
+  fiO2_slope_per_hr: 0.01
+  spO2_time_ge_94: 0.80
+  resp_support_slope: 0
+  lactate_slope_per_hr: 0.05
+  lactate_now_threshold: 2.0
+  drain_sum_4h: 200
+  hb_drop_6h: -10
+
+training:
+  lookback_hours: 12
+  min_rows_per_encounter: 1
+  calib_holdout_frac: 0.1
+  test_frac: 0.2
+
+xgboost_params:
+  max_depth: 4
+  learning_rate: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  n_estimators: 500
+  reg_lambda: 1.0
+  n_jobs: 4
+
+model:
+  calibration: isotonic
+  min_calibration_samples: 200
+  random_state: 42
+
+baseline:
+  base_iri: 80
+  penalties:
+    pressor_on: 20
+    pressor_escalating: 10
+    fio2_slope_worsening: 15
+    spo2_time_low: 10
+    resp_support_worsening: 10
+    lactate_slope_worsening: 15
+    lactate_now_high: 10
+    drain_high: 15
+    hb_drop: 10
+    rass_extreme: 10
+    oliguria: 10
+
+feature_schema:
+  - MAP_mean_4h
+  - MAP_sd_4h
+  - MAP_min_4h
+  - MAP_slope_4h
+  - MAP_time_ge_65
+  - HR_mean_4h
+  - HR_sd_4h
+  - HR_slope_4h
+  - pressor_on
+  - pressor_escalating
+  - pressor_delta_4h
+  - pressor_free_hours
+  - FiO2_now
+  - FiO2_slope_4h
+  - SpO2_time_ge_94
+  - RR_mean_4h
+  - RR_slope_4h
+  - resp_support_level_now
+  - resp_support_level_slope
+  - extubated_hours
+  - drain_sum_4h
+  - drain_sum_8h
+  - drain_slope
+  - Hb_delta_6h
+  - uop_sum_4h
+  - oliguria_flag
+  - lactate_now
+  - lactate_slope_4h
+  - creatinine_delta_24h
+  - RASS_now
+  - temp_slope_4h
+  - WCC_slope_24h
+  - arterial_line_present_latest
+  - insulin_infusion_latest
+  - lactate_age_hours
+  - Hb_age_hours
+  - creatinine_age_hours
+  - WCC_age_hours
+  - pressor_missing_4h
+  - resp_missing_4h
+  - map_missing_4h

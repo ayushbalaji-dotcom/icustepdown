@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ICU Step-Down Readiness</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="hero">
+        <div>
+          <h1>ICU to HDU Step-Down</h1>
+          <p>Decision support only. Conservative, fail-closed.</p>
+        </div>
+        <div class="nhs-card">
+          <label for="nhsNumber">NHS number</label>
+          <div class="nhs-row">
+            <input id="nhsNumber" type="text" placeholder="Enter NHS number" />
+            <button id="startBtn">Start patient</button>
+          </div>
+          <div class="nhs-actions">
+            <button id="newEncounterBtn" class="ghost">Start new encounter</button>
+          </div>
+          <p id="nhsStatus" class="muted"></p>
+        </div>
+      </section>
+
+      <section id="entrySection" class="panel hidden">
+        <header class="panel-header">
+          <h2>Hourly data entry</h2>
+          <div class="panel-actions">
+            <button id="scoreBtn" class="ghost">Refresh score</button>
+          </div>
+        </header>
+
+        <div class="grid">
+          <div class="card">
+            <h3>Timing</h3>
+            <label>Timestamp (hourly)</label>
+            <input id="timestamp" type="datetime-local" />
+          </div>
+
+          <div class="card">
+            <h3>Respiratory</h3>
+            <label>SpO2 (%)</label>
+            <input id="SpO2" type="number" step="0.1" />
+            <label>FiO2 (fraction)</label>
+            <input id="FiO2" type="number" step="0.01" />
+            <label>RR (/min)</label>
+            <input id="RR" type="number" step="1" />
+            <label>Oxygen device</label>
+            <select id="oxygen_device">
+              <option value="">--</option>
+              <option>RA</option>
+              <option>NC</option>
+              <option>Mask</option>
+              <option>Venturi</option>
+              <option>HFNC</option>
+              <option>NIV</option>
+              <option>ETT</option>
+            </select>
+          </div>
+
+          <div class="card">
+            <h3>Cardiovascular</h3>
+            <label>MAP (mmHg)</label>
+            <input id="MAP" type="number" step="1" />
+            <label>HR (bpm)</label>
+            <input id="HR" type="number" step="1" />
+            <label>Noradrenaline (mcg/kg/min)</label>
+            <input id="noradrenaline_mcgkgmin" type="number" step="0.01" />
+            <label>Adrenaline (mcg/kg/min)</label>
+            <input id="adrenaline_mcgkgmin" type="number" step="0.01" />
+            <label>Dobutamine (mcg/kg/min)</label>
+            <input id="dobutamine_mcgkgmin" type="number" step="0.01" />
+            <label>Milrinone (mcg/kg/min)</label>
+            <input id="milrinone_mcgkgmin" type="number" step="0.01" />
+          </div>
+
+          <div class="card">
+            <h3>Renal and perfusion</h3>
+            <label>Urine output (ml / 30 min)</label>
+            <input id="urine_output_ml_30min" type="number" step="1" />
+            <label>Lactate</label>
+            <input id="lactate" type="number" step="0.1" />
+            <label>Creatinine (umol/L)</label>
+            <input id="creatinine_umolL" type="number" step="1" />
+          </div>
+
+          <div class="card">
+            <h3>Surgical / bleeding</h3>
+            <label>Chest drain (ml / 30 min)</label>
+            <input id="chest_drain_ml_30min" type="number" step="1" />
+            <label>Haemoglobin (g/L)</label>
+            <input id="haemoglobin_gL" type="number" step="1" />
+          </div>
+
+          <div class="card">
+            <h3>Neurological / infection</h3>
+            <label>RASS</label>
+            <input id="RASS" type="number" step="1" />
+            <label>Temperature (C)</label>
+            <input id="temperature_C" type="number" step="0.1" />
+            <label>WCC (10e9/L)</label>
+            <input id="WCC_10e9L" type="number" step="0.1" />
+          </div>
+
+          <div class="card">
+            <h3>Dependency</h3>
+            <label>Arterial line present (0/1)</label>
+            <input id="arterial_line_present" type="number" step="1" />
+            <label>Central line present (0/1)</label>
+            <input id="central_line_present" type="number" step="1" />
+            <label>Insulin infusion (0/1)</label>
+            <input id="insulin_infusion" type="number" step="1" />
+            <label>Pacing active (0/1)</label>
+            <input id="pacing_active" type="number" step="1" />
+          </div>
+
+          <div class="card">
+            <h3>Imaging</h3>
+            <label>Imaging summary (free text)</label>
+            <textarea id="imaging_summary" rows="4"></textarea>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="submitBtn">Add hourly data</button>
+          <button id="dummyBtn" class="ghost">Fill dummy values (no time)</button>
+          <p id="submitStatus" class="muted"></p>
+        </div>
+        <div id="toast" class="toast hidden">
+          <span id="toastMessage"></span>
+          <button id="toastClose" class="toast-close">Close</button>
+        </div>
+      </section>
+
+      <section id="scoreSection" class="panel hidden">
+        <header class="panel-header">
+          <h2>Latest readiness score</h2>
+        </header>
+
+        <div class="score-grid">
+          <div class="score-card" id="trafficCard">
+            <div class="traffic" id="trafficLight">RED</div>
+            <div class="score-meta">
+              <div><span>IRI</span><strong id="iriValue">--</strong></div>
+              <div><span>Trend</span><strong id="trendValue">--</strong></div>
+              <div><span>Limiting factor</span><strong id="limitingValue">--</strong></div>
+            </div>
+            <div class="signals">
+              <div class="label">Signals</div>
+              <div id="signalsValue">Insufficient data</div>
+            </div>
+          </div>
+
+          <div class="domain-card">
+            <h3>Domains</h3>
+            <div class="domain-list" id="domainList"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

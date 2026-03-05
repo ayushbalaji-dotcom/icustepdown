@@ -1,0 +1,9 @@
+pandas
+numpy<2
+openpyxl
+pyyaml
+xgboost
+scikit-learn
+typer
+pytest
+streamlit

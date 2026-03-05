@@ -1,0 +1,247 @@
+:root {
+  --bg: #f5f2eb;
+  --ink: #1a1a1a;
+  --muted: #5c5c5c;
+  --panel: #ffffff;
+  --accent: #ff6b35;
+  --green: #1a8f5a;
+  --amber: #e59f00;
+  --red: #c1121f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "IBM Plex Sans", "Segoe UI", Tahoma, sans-serif;
+  background: radial-gradient(circle at 20% 10%, #ffe8d6, transparent 40%),
+    radial-gradient(circle at 90% 20%, #d9f0ff, transparent 35%),
+    var(--bg);
+  color: var(--ink);
+}
+
+.app {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 32px 20px 64px;
+}
+
+.hero {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr;
+  gap: 24px;
+  align-items: center;
+}
+
+.hero h1 {
+  font-size: 36px;
+  margin: 0 0 8px;
+}
+
+.nhs-card {
+  background: var(--panel);
+  padding: 16px;
+  border: 1px solid #e6e0d8;
+  border-radius: 12px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.06);
+}
+
+.nhs-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.nhs-actions {
+  margin-top: 10px;
+}
+
+label {
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+input, select, textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #d7d2c9;
+  border-radius: 8px;
+  background: #fffdf9;
+  font-size: 14px;
+}
+
+button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 10px 16px;
+  border-radius: 10px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button.ghost {
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid #d7d2c9;
+}
+
+.panel {
+  margin-top: 24px;
+  background: var(--panel);
+  border-radius: 14px;
+  padding: 20px;
+  border: 1px solid #e6e0d8;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
+}
+
+.card {
+  background: #fffaf2;
+  border: 1px solid #efe6db;
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.score-grid {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr;
+  gap: 16px;
+}
+
+.score-card {
+  padding: 16px;
+  border-radius: 14px;
+  background: #fef9f3;
+  border: 1px solid #efe6db;
+}
+
+.traffic {
+  font-size: 32px;
+  font-weight: 700;
+  padding: 10px 14px;
+  border-radius: 10px;
+  display: inline-block;
+  color: #fff;
+}
+
+.traffic.green { background: var(--green); }
+.traffic.amber { background: var(--amber); }
+.traffic.red { background: var(--red); }
+
+.score-meta {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.score-meta span {
+  color: var(--muted);
+  font-size: 12px;
+  display: block;
+}
+
+.score-meta strong {
+  font-size: 18px;
+}
+
+.signals {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed #e0d6c9;
+}
+
+.domain-card {
+  padding: 16px;
+  border-radius: 14px;
+  background: #fff;
+  border: 1px solid #efe6db;
+}
+
+.domain-list {
+  display: grid;
+  gap: 10px;
+}
+
+.domain-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #fbf5ec;
+}
+
+.badge {
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: #e6e0d8;
+}
+
+.badge.on {
+  background: #ffd6c2;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.toast {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #fff3e6;
+  border: 1px solid #f2c9aa;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.toast.error {
+  background: #fde8e8;
+  border-color: #f5b6b6;
+}
+
+.toast-close {
+  background: transparent;
+  border: 1px solid #d7d2c9;
+  color: var(--ink);
+  padding: 6px 10px;
+  border-radius: 8px;
+}
+
+.hidden {
+  display: none;
+}
+
+@media (max-width: 900px) {
+  .hero { grid-template-columns: 1fr; }
+  .score-grid { grid-template-columns: 1fr; }
+}
