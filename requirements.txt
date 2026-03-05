@@ -7,3 +7,4 @@ scikit-learn
 typer
 pytest
 streamlit
+altair<5
