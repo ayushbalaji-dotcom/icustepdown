@@ -33,6 +33,7 @@ columns:
     - central_line_present
     - insulin_infusion
     - pacing_active
+    - rhythm
     - imaging_summary
 
 outcomes_columns:

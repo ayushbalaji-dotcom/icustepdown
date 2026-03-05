@@ -26,6 +26,43 @@
         </div>
       </section>
 
+      <section id="preopSection" class="panel hidden">
+        <header class="panel-header">
+          <h2>Pre-op characteristics</h2>
+        </header>
+
+        <div class="grid">
+          <div class="card">
+            <h3>Baseline</h3>
+            <label>Age (years)</label>
+            <input id="preop_age" type="number" step="1" />
+            <label>BMI (kg/m2)</label>
+            <input id="preop_bmi" type="number" step="0.1" />
+            <label>Frailty score (1-9)</label>
+            <input id="preop_frailty" type="number" step="1" />
+          </div>
+
+          <div class="card">
+            <h3>Cardio-renal</h3>
+            <label>Renal function (eGFR ml/min)</label>
+            <input id="preop_renal" type="number" step="1" />
+            <label>LV function (LVEF %)</label>
+            <input id="preop_lv" type="number" step="1" />
+            <label>Diabetes</label>
+            <select id="preop_diabetes">
+              <option value="">--</option>
+              <option value="Yes">Yes</option>
+              <option value="No">No</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="savePreopBtn">Save pre-op data</button>
+          <p id="preopStatus" class="muted"></p>
+        </div>
+      </section>
+
       <section id="entrySection" class="panel hidden">
         <header class="panel-header">
           <h2>Hourly data entry</h2>
@@ -114,8 +151,13 @@
             <input id="central_line_present" type="number" step="1" />
             <label>Insulin infusion (0/1)</label>
             <input id="insulin_infusion" type="number" step="1" />
-            <label>Pacing active (0/1)</label>
-            <input id="pacing_active" type="number" step="1" />
+            <label>Rhythm</label>
+            <select id="rhythm">
+              <option value="">--</option>
+              <option>Sinus</option>
+              <option>AF</option>
+              <option>Pacing required</option>
+            </select>
           </div>
 
           <div class="card">

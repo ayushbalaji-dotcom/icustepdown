@@ -2,8 +2,11 @@ const startBtn = document.getElementById('startBtn');
 const newEncounterBtn = document.getElementById('newEncounterBtn');
 const nhsInput = document.getElementById('nhsNumber');
 const nhsStatus = document.getElementById('nhsStatus');
+const preopSection = document.getElementById('preopSection');
 const entrySection = document.getElementById('entrySection');
 const scoreSection = document.getElementById('scoreSection');
+const savePreopBtn = document.getElementById('savePreopBtn');
+const preopStatus = document.getElementById('preopStatus');
 const submitBtn = document.getElementById('submitBtn');
 const dummyBtn = document.getElementById('dummyBtn');
 const submitStatus = document.getElementById('submitStatus');
@@ -20,16 +23,20 @@ const signalsValue = document.getElementById('signalsValue');
 const domainList = document.getElementById('domainList');
 
 let currentNhs = null;
-const storedNhs = localStorage.getItem('icu_stepdown_nhs');
-if (storedNhs) {
-  currentNhs = storedNhs;
-}
 
 function pad(n) { return n < 10 ? `0${n}` : n; }
 
 function setDefaultTimestamp() {
   // Manual entry only; leave timestamp empty.
   document.getElementById('timestamp').value = '';
+}
+
+function setPreopReady(isReady) {
+  if (isReady) {
+    entrySection.classList.remove('hidden');
+  } else {
+    entrySection.classList.add('hidden');
+  }
 }
 
 function trafficClass(value) {
@@ -85,12 +92,15 @@ async function startPatient() {
   const data = await res.json();
   if (data.status === 'ok') {
     currentNhs = nhs;
-    localStorage.setItem('icu_stepdown_nhs', nhs);
     const enc = data.encounter_id ? ` Encounter ${data.encounter_id}.` : '';
     nhsStatus.textContent = `Patient started. Data stored locally.${enc}`;
+    preopSection.classList.remove('hidden');
     entrySection.classList.remove('hidden');
     scoreSection.classList.remove('hidden');
     setDefaultTimestamp();
+    clearPreopForm();
+    setPreopReady(false);
+    await loadPreop();
     await refreshScore();
   } else {
     nhsStatus.textContent = data.error || 'Unable to start.';
@@ -111,15 +121,90 @@ async function startNewEncounter() {
   const data = await res.json();
   if (data.status === 'ok') {
     currentNhs = nhs;
-    localStorage.setItem('icu_stepdown_nhs', nhs);
     const enc = data.encounter_id ? ` Encounter ${data.encounter_id}.` : '';
     nhsStatus.textContent = `New encounter started.${enc}`;
+    preopSection.classList.remove('hidden');
     entrySection.classList.remove('hidden');
     scoreSection.classList.remove('hidden');
     setDefaultTimestamp();
+    clearPreopForm();
+    setPreopReady(false);
     await refreshScore();
   } else {
     nhsStatus.textContent = data.error || 'Unable to start new encounter.';
+  }
+}
+
+function clearPreopForm() {
+  const ids = ['preop_age', 'preop_bmi', 'preop_frailty', 'preop_renal', 'preop_lv', 'preop_diabetes'];
+  ids.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  preopStatus.textContent = '';
+}
+
+function fillPreopForm(preop) {
+  if (!preop) return;
+  const map = {
+    preop_age: preop.age_years,
+    preop_bmi: preop.bmi,
+    preop_frailty: preop.frailty_score,
+    preop_renal: preop.renal_function,
+    preop_lv: preop.lv_function,
+    preop_diabetes: preop.diabetes === 1 || preop.diabetes === true ? 'Yes' : preop.diabetes === 0 ? 'No' : ''
+  };
+  Object.entries(map).forEach(([id, value]) => {
+    const el = document.getElementById(id);
+    if (!el || value == null) return;
+    el.value = value;
+  });
+}
+
+function collectPreop() {
+  const getValue = (id) => {
+    const el = document.getElementById(id);
+    if (!el) return '';
+    return String(el.value || '').trim();
+  };
+  return {
+    age_years: getValue('preop_age'),
+    bmi: getValue('preop_bmi'),
+    frailty_score: getValue('preop_frailty'),
+    renal_function: getValue('preop_renal'),
+    lv_function: getValue('preop_lv'),
+    diabetes: getValue('preop_diabetes')
+  };
+}
+
+async function loadPreop() {
+  if (!currentNhs) return;
+  const res = await fetch(`/api/preop?nhs_number=${encodeURIComponent(currentNhs)}`);
+  const data = await res.json();
+  if (data.status === 'ok') {
+    fillPreopForm(data.preop);
+    preopStatus.textContent = 'Pre-op data loaded.';
+    setPreopReady(true);
+  } else {
+    preopStatus.textContent = 'Enter pre-op characteristics to continue.';
+    setPreopReady(false);
+  }
+}
+
+async function savePreop() {
+  if (!currentNhs) return;
+  const preop = collectPreop();
+  const res = await fetch('/api/preop', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nhs_number: currentNhs, preop })
+  });
+  const data = await res.json();
+  if (data.status === 'ok') {
+    preopStatus.textContent = 'Pre-op data saved.';
+    setPreopReady(true);
+  } else {
+    preopStatus.textContent = data.error || 'Unable to save pre-op data.';
   }
 }
 
@@ -129,7 +214,7 @@ function collectRow() {
     'noradrenaline_mcgkgmin','adrenaline_mcgkgmin','dobutamine_mcgkgmin','milrinone_mcgkgmin',
     'urine_output_ml_30min','chest_drain_ml_30min','lactate','haemoglobin_gL','creatinine_umolL',
     'WCC_10e9L','temperature_C','RASS',
-    'oxygen_device','arterial_line_present','central_line_present','insulin_infusion','pacing_active','imaging_summary'
+    'oxygen_device','arterial_line_present','central_line_present','insulin_infusion','rhythm','imaging_summary'
   ];
   const row = {};
   fields.forEach(id => {
@@ -139,6 +224,9 @@ function collectRow() {
     if (value === '') return;
     row[id] = value;
   });
+  if (row.rhythm) {
+    row.pacing_active = row.rhythm === 'Pacing required' ? 1 : 0;
+  }
   return row;
 }
 
@@ -214,6 +302,7 @@ async function refreshScore() {
 
 startBtn.addEventListener('click', startPatient);
 newEncounterBtn.addEventListener('click', startNewEncounter);
+savePreopBtn.addEventListener('click', savePreop);
 submitBtn.addEventListener('click', submitRow);
 scoreBtn.addEventListener('click', refreshScore);
 toastClose.addEventListener('click', hideToast);
@@ -242,7 +331,7 @@ function fillDummyValues() {
     arterial_line_present: 1,
     central_line_present: 1,
     insulin_infusion: 0,
-    pacing_active: 0,
+    rhythm: 'Sinus',
     imaging_summary: 'CXR clear'
   };
   Object.entries(dummy).forEach(([key, value]) => {
@@ -253,10 +342,3 @@ function fillDummyValues() {
 }
 
 dummyBtn.addEventListener('click', fillDummyValues);
-
-if (currentNhs) {
-  nhsInput.value = currentNhs;
-  entrySection.classList.remove('hidden');
-  scoreSection.classList.remove('hidden');
-  refreshScore();
-}

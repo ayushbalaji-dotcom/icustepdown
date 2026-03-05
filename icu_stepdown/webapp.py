@@ -8,7 +8,7 @@ import pandas as pd
 
 from .config import load_config
 from .features import compute_features
-from .patient_store import append_row, load_rows, start_encounter
+from .patient_store import append_row, load_preop, load_rows, save_preop, start_encounter
 from .preprocess import preprocess
 from .quality import QualityLogger
 from .schema import validate_raw
@@ -25,6 +25,26 @@ class StepdownHandler(BaseHTTPRequestHandler):
         if pd.isna(ts):
             raise ValueError("invalid_timestamp_format")
         return ts.isoformat()
+
+    @staticmethod
+    def _parse_optional_float(value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        if text == "":
+            return None
+        try:
+            return float(text.replace(",", ""))
+        except ValueError as exc:
+            raise ValueError("invalid_number") from exc
+
+    @staticmethod
+    def _parse_yes_no(value):
+        if value in (True, 1, "1", "Yes", "yes", "Y", "y"):
+            return 1.0
+        if value in (False, 0, "0", "No", "no", "N", "n"):
+            return 0.0
+        return None
 
     @staticmethod
     def _sanitize(obj):
@@ -72,6 +92,10 @@ class StepdownHandler(BaseHTTPRequestHandler):
             return self._send_file(os.path.join(self.server.static_dir, "app.js"), "application/javascript")
         if parsed.path == "/styles.css":
             return self._send_file(os.path.join(self.server.static_dir, "styles.css"), "text/css")
+        if parsed.path == "/api/preop":
+            qs = parse_qs(parsed.query)
+            nhs = qs.get("nhs_number", [""])[0]
+            return self._handle_preop_get(nhs)
         if parsed.path == "/api/score":
             qs = parse_qs(parsed.query)
             nhs = qs.get("nhs_number", [""])[0]
@@ -97,6 +121,25 @@ class StepdownHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send_json(400, {"error": str(e)})
 
+        if self.path == "/api/preop":
+            nhs = payload.get("nhs_number")
+            preop = payload.get("preop", {})
+            if not nhs:
+                return self._send_json(400, {"error": "missing_nhs_number"})
+            try:
+                normalized = {
+                    "age_years": self._parse_optional_float(preop.get("age_years")),
+                    "bmi": self._parse_optional_float(preop.get("bmi")),
+                    "frailty_score": self._parse_optional_float(preop.get("frailty_score")),
+                    "renal_function": self._parse_optional_float(preop.get("renal_function")),
+                    "lv_function": self._parse_optional_float(preop.get("lv_function")),
+                    "diabetes": self._parse_yes_no(preop.get("diabetes")),
+                }
+                encounter_id = save_preop(self.server.db_path, nhs, normalized)
+                return self._send_json(200, {"status": "ok", "encounter_id": encounter_id})
+            except Exception as e:
+                return self._send_json(400, {"error": str(e)})
+
         if self.path == "/api/append":
             nhs = payload.get("nhs_number")
             row = payload.get("row", {})
@@ -115,6 +158,17 @@ class StepdownHandler(BaseHTTPRequestHandler):
 
         self.send_response(404)
         self.end_headers()
+
+    def _handle_preop_get(self, nhs_number: str):
+        if not nhs_number:
+            return self._send_json(400, {"error": "missing_nhs_number"})
+        try:
+            preop = load_preop(self.server.db_path, nhs_number)
+        except Exception as e:
+            return self._send_json(400, {"error": str(e)})
+        if not preop:
+            return self._send_json(200, {"status": "no_data"})
+        return self._send_json(200, {"status": "ok", "preop": preop})
 
     def _handle_score(self, nhs_number: str):
         if not nhs_number:
@@ -186,6 +240,10 @@ class StepdownHandler(BaseHTTPRequestHandler):
             "domain_flags": domain,
             "warning": warning,
         })
+
+    def log_message(self, format, *args):
+        # Avoid logging request paths that might contain identifiers.
+        return
 
 
 class StepdownServer(HTTPServer):

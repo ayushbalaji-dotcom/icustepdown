@@ -74,6 +74,7 @@ icu-stepdown serve --host 127.0.0.1 --port 8000 --model model.pkl --db-path data
 ```
 
 The UI stores hourly entries per patient in SQLite at `database/icu_stepdown.sqlite`.
+Patient identifiers are pseudonymized using an HMAC key (`ICU_PSEUDO_KEY`) or a local key file at `database/.icu_pseudo_key`.
 Scores are produced only after 4 hours of data are present.
 
 ## Streamlit Hosting
@@ -91,7 +92,7 @@ export ICU_APP_USER="your_user"
 export ICU_APP_PASS="your_pass"
 ```
 
-The Streamlit app creates a per-patient subdirectory under `database/<NHS_NUMBER>/icu_stepdown.sqlite`.
+The Streamlit app creates a per-patient subdirectory under `database/<PSEUDO_ID>/icu_stepdown.sqlite`.
 
 ## Hard Stops vs ML
 

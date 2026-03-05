@@ -6,7 +6,7 @@ import streamlit as st
 
 from icu_stepdown.config import load_config
 from icu_stepdown.features import compute_features, compute_features_latest
-from icu_stepdown.patient_store import append_row, load_rows, start_encounter
+from icu_stepdown.patient_store import append_row, load_preop, load_rows, save_preop, start_encounter, pseudonymize_nhs
 from icu_stepdown.preprocess import preprocess
 from icu_stepdown.quality import QualityLogger
 from icu_stepdown.schema import validate_raw
@@ -40,6 +40,15 @@ def _parse_yes_no(value: str | None) -> float | None:
     if value == "No":
         return 0.0
     return None
+
+
+def _legacy_db_dir_candidates(nhs_number: str) -> list[str]:
+    raw = str(nhs_number)
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    candidates = [os.path.join("database", raw)]
+    if digits and digits != raw:
+        candidates.append(os.path.join("database", digits))
+    return candidates
 
 
 def _secret_get(key: str) -> str | None:
@@ -137,7 +146,14 @@ if col1.button("Start patient"):
         st.error("Enter NHS number")
     else:
         st.session_state.nhs_number = nhs_number
-        db_dir = os.path.join("database", nhs_number)
+        pseudo_id = pseudonymize_nhs(nhs_number, os.path.join("database", "icu_stepdown.sqlite"))
+        db_dir = os.path.join("database", pseudo_id)
+        for legacy_dir in _legacy_db_dir_candidates(nhs_number):
+            if legacy_dir != db_dir and os.path.isdir(legacy_dir) and not os.path.isdir(db_dir):
+                try:
+                    os.rename(legacy_dir, db_dir)
+                except Exception:
+                    pass
         os.makedirs(db_dir, exist_ok=True)
         db_path = os.path.join(db_dir, "icu_stepdown.sqlite")
         st.session_state.db_path = db_path
@@ -148,7 +164,14 @@ if col2.button("Start new encounter"):
         st.error("Enter NHS number")
     else:
         st.session_state.nhs_number = nhs_number
-        db_dir = os.path.join("database", nhs_number)
+        pseudo_id = pseudonymize_nhs(nhs_number, os.path.join("database", "icu_stepdown.sqlite"))
+        db_dir = os.path.join("database", pseudo_id)
+        for legacy_dir in _legacy_db_dir_candidates(nhs_number):
+            if legacy_dir != db_dir and os.path.isdir(legacy_dir) and not os.path.isdir(db_dir):
+                try:
+                    os.rename(legacy_dir, db_dir)
+                except Exception:
+                    pass
         os.makedirs(db_dir, exist_ok=True)
         db_path = os.path.join(db_dir, "icu_stepdown.sqlite")
         st.session_state.db_path = db_path
@@ -157,6 +180,51 @@ if col2.button("Start new encounter"):
 
 if "db_path" not in st.session_state:
     st.info("Start a patient to begin data entry.")
+    st.stop()
+
+st.subheader("Pre-op characteristics")
+preop_existing = load_preop(st.session_state.db_path, st.session_state.nhs_number)
+preop_age_default = "" if not preop_existing else preop_existing.get("age_years") or ""
+preop_bmi_default = "" if not preop_existing else preop_existing.get("bmi") or ""
+preop_frailty_default = "" if not preop_existing else preop_existing.get("frailty_score") or ""
+preop_renal_default = "" if not preop_existing else preop_existing.get("renal_function") or ""
+preop_lv_default = "" if not preop_existing else preop_existing.get("lv_function") or ""
+preop_diabetes_default = "" if not preop_existing else ("Yes" if preop_existing.get("diabetes") == 1 else "No" if preop_existing.get("diabetes") == 0 else "")
+
+with st.form("preop_entry"):
+    col_p1, col_p2, col_p3 = st.columns(3)
+    with col_p1:
+        preop_age = st.text_input("Age (years)", value=preop_age_default)
+        preop_bmi = st.text_input("BMI (kg/m2)", value=preop_bmi_default)
+    with col_p2:
+        preop_frailty = st.text_input("Frailty score (1-9)", value=preop_frailty_default)
+        preop_renal = st.text_input("Renal function (eGFR ml/min)", value=preop_renal_default)
+    with col_p3:
+        preop_lv = st.text_input("LV function (LVEF %)", value=preop_lv_default)
+        diabetes_index = 0
+        if preop_diabetes_default == "Yes":
+            diabetes_index = 1
+        elif preop_diabetes_default == "No":
+            diabetes_index = 2
+        preop_diabetes = st.selectbox("Diabetes", ["", "Yes", "No"], index=diabetes_index)
+    preop_submitted = st.form_submit_button("Save pre-op data")
+    if preop_submitted:
+        try:
+            preop_row = {
+                "age_years": _parse_optional_float("Age (years)", preop_age),
+                "bmi": _parse_optional_float("BMI (kg/m2)", preop_bmi),
+                "frailty_score": _parse_optional_float("Frailty score (1-9)", preop_frailty),
+                "renal_function": _parse_optional_float("Renal function (eGFR ml/min)", preop_renal),
+                "lv_function": _parse_optional_float("LV function (LVEF %)", preop_lv),
+                "diabetes": _parse_yes_no(preop_diabetes),
+            }
+            save_preop(st.session_state.db_path, st.session_state.nhs_number, preop_row)
+            st.success("Saved pre-op data.")
+        except Exception as e:
+            st.error(str(e))
+
+if not load_preop(st.session_state.db_path, st.session_state.nhs_number):
+    st.info("Enter pre-op characteristics before hourly data entry.")
     st.stop()
 
 st.subheader("Hourly data entry")
@@ -191,7 +259,7 @@ with st.form("data_entry"):
     arterial_line_present = st.selectbox("Arterial line present", ["", "Yes", "No"])
     central_line_present = st.selectbox("Central line present", ["", "Yes", "No"])
     insulin_infusion = st.selectbox("Insulin infusion", ["", "Yes", "No"])
-    pacing_active = st.selectbox("Pacing active", ["", "Yes", "No"])
+    rhythm = st.selectbox("Rhythm", ["", "Sinus", "AF", "Pacing required"])
     imaging_summary = st.text_area("Imaging summary (optional)")
     submitted = st.form_submit_button("Add hourly data")
 
@@ -221,7 +289,8 @@ with st.form("data_entry"):
                 "arterial_line_present": _parse_yes_no(arterial_line_present),
                 "central_line_present": _parse_yes_no(central_line_present),
                 "insulin_infusion": _parse_yes_no(insulin_infusion),
-                "pacing_active": _parse_yes_no(pacing_active),
+                "pacing_active": 1.0 if rhythm == "Pacing required" else 0.0 if rhythm else None,
+                "rhythm": rhythm or None,
                 "imaging_summary": imaging_summary or None,
             }
             append_row(st.session_state.db_path, st.session_state.nhs_number, row)
