@@ -1,5 +1,6 @@
 __all__ = [
     "config",
+    "auth",
     "schema",
     "io_excel",
     "preprocess",
@@ -12,6 +13,8 @@ __all__ = [
     "quality",
     "versioning",
     "patient_store",
+    "ops_store",
+    "ops_logic",
     "webapp",
 ]
 
