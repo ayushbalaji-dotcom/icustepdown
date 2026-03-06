@@ -147,6 +147,7 @@ if col1.button("Start patient"):
     else:
         st.session_state.nhs_number = nhs_number
         pseudo_id = pseudonymize_nhs(nhs_number, os.path.join("database", "icu_stepdown.sqlite"))
+        st.session_state.pseudo_id = pseudo_id
         db_dir = os.path.join("database", pseudo_id)
         for legacy_dir in _legacy_db_dir_candidates(nhs_number):
             if legacy_dir != db_dir and os.path.isdir(legacy_dir) and not os.path.isdir(db_dir):
@@ -159,12 +160,14 @@ if col1.button("Start patient"):
         st.session_state.db_path = db_path
         enc = start_encounter(db_path, nhs_number, force_new=False)
         st.success(f"Using encounter {enc}")
+        st.session_state.last_score = _score_from_db(db_path, cfg, model_path or None, hard_stops_only)
 if col2.button("Start new encounter"):
     if not nhs_number:
         st.error("Enter NHS number")
     else:
         st.session_state.nhs_number = nhs_number
         pseudo_id = pseudonymize_nhs(nhs_number, os.path.join("database", "icu_stepdown.sqlite"))
+        st.session_state.pseudo_id = pseudo_id
         db_dir = os.path.join("database", pseudo_id)
         for legacy_dir in _legacy_db_dir_candidates(nhs_number):
             if legacy_dir != db_dir and os.path.isdir(legacy_dir) and not os.path.isdir(db_dir):
@@ -177,10 +180,14 @@ if col2.button("Start new encounter"):
         st.session_state.db_path = db_path
         enc = start_encounter(db_path, nhs_number, force_new=True)
         st.success(f"New encounter {enc} started")
+        st.session_state.last_score = _score_from_db(db_path, cfg, model_path or None, hard_stops_only)
 
 if "db_path" not in st.session_state:
     st.info("Start a patient to begin data entry.")
     st.stop()
+
+if st.session_state.get("pseudo_id"):
+    st.caption(f"Pseudo ID: {st.session_state.pseudo_id}")
 
 st.subheader("Pre-op characteristics")
 preop_existing = load_preop(st.session_state.db_path, st.session_state.nhs_number)
@@ -223,9 +230,9 @@ with st.form("preop_entry"):
         except Exception as e:
             st.error(str(e))
 
-if not load_preop(st.session_state.db_path, st.session_state.nhs_number):
-    st.info("Enter pre-op characteristics before hourly data entry.")
-    st.stop()
+preop_ready = bool(preop_existing)
+if not preop_ready:
+    st.info("Enter pre-op characteristics to enable hourly data entry.")
 
 st.subheader("Hourly data entry")
 with st.form("data_entry"):
@@ -264,6 +271,9 @@ with st.form("data_entry"):
     submitted = st.form_submit_button("Add hourly data")
 
     if submitted:
+        if not preop_ready:
+            st.error("Pre-op characteristics are required before saving hourly data.")
+            st.stop()
         try:
             parsed_ts = _parse_timestamp(datetime.combine(ts_date, ts_time))
             row = {
