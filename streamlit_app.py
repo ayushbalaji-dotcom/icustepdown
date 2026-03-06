@@ -42,6 +42,19 @@ def _parse_yes_no(value: str | None) -> float | None:
     return None
 
 
+def _safe_display_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    safe = df.copy()
+    for col in safe.columns:
+        if pd.api.types.is_object_dtype(safe[col]) or pd.api.types.is_string_dtype(safe[col]):
+            try:
+                safe[col] = safe[col].astype("string[python]")
+            except Exception:
+                safe[col] = safe[col].astype(str)
+    return safe
+
+
 def _legacy_db_dir_candidates(nhs_number: str) -> list[str]:
     raw = str(nhs_number)
     digits = "".join(ch for ch in raw if ch.isdigit())
@@ -353,4 +366,4 @@ if result:
 st.subheader("Raw data (latest encounter)")
 rows = load_rows(st.session_state.db_path, st.session_state.nhs_number)
 if rows:
-    st.dataframe(pd.DataFrame(rows))
+    st.dataframe(_safe_display_df(pd.DataFrame(rows)))
