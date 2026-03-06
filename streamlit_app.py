@@ -3,6 +3,11 @@ from typing import Any, List
 from datetime import datetime
 
 import pandas as pd
+
+try:
+    pd.options.mode.string_storage = "python"
+except Exception:
+    pass
 import streamlit as st
 
 from icu_stepdown.auth import resolve_expected_credentials, validate_credentials
@@ -88,6 +93,19 @@ def _safe_display_df(df: pd.DataFrame) -> pd.DataFrame:
             except Exception:
                 safe[col] = safe[col].map(lambda value: str(value))
         return safe
+
+
+def _safe_editor_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    safe = df.copy()
+    for col in safe.columns:
+        if pd.api.types.is_object_dtype(safe[col]) or pd.api.types.is_string_dtype(safe[col]):
+            try:
+                safe[col] = safe[col].astype(str)
+            except Exception:
+                safe[col] = safe[col].map(lambda value: str(value))
+    return safe
 
 
 def _pill(label: str, kind: str) -> None:
@@ -832,7 +850,7 @@ with admin_tabs[2]:
     los_df = pd.DataFrame(los_rows)
     if not los_df.empty:
         los_df = los_df[["procedure_group", "avg_icu_los_hours", "avg_hdu_los_hours", "comments", "last_reviewed"]]
-    edited = _data_editor(los_df, num_rows="dynamic", use_container_width=True)
+    edited = _data_editor(_safe_editor_df(los_df), num_rows="dynamic", use_container_width=True)
     if st.button("Save LOS reference"):
         save_procedure_los(OPS_DB_PATH, edited.to_dict(orient="records"), st.session_state.get("current_user"))
         st.success("LOS reference updated.")
@@ -843,7 +861,7 @@ with admin_tabs[3]:
     theatre_df = pd.DataFrame(theatre_rows)
     if not theatre_df.empty:
         theatre_df = theatre_df[["case_date", "procedure_group", "expected_arrival_time", "icu_need", "is_emergency", "notes"]]
-    edited = _data_editor(theatre_df, num_rows="dynamic", use_container_width=True)
+    edited = _data_editor(_safe_editor_df(theatre_df), num_rows="dynamic", use_container_width=True)
     if st.button("Save theatre schedule"):
         save_theatre_schedule(OPS_DB_PATH, edited.to_dict(orient="records"), st.session_state.get("current_user"))
         st.success("Theatre schedule updated.")
