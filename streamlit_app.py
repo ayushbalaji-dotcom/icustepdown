@@ -78,13 +78,16 @@ def _safe_display_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     safe = df.copy()
-    for col in safe.columns:
-        if pd.api.types.is_object_dtype(safe[col]) or pd.api.types.is_string_dtype(safe[col]):
+    # Streamlit 1.19 + pyarrow can choke on LargeUtf8. Force Python strings for display.
+    try:
+        return safe.astype(str)
+    except Exception:
+        for col in safe.columns:
             try:
-                safe[col] = safe[col].astype("string[python]")
-            except Exception:
                 safe[col] = safe[col].astype(str)
-    return safe
+            except Exception:
+                safe[col] = safe[col].map(lambda value: str(value))
+        return safe
 
 
 def _pill(label: str, kind: str) -> None:
