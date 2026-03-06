@@ -2,6 +2,7 @@ import os
 from typing import Any, List
 from datetime import datetime
 
+import json
 import pandas as pd
 
 try:
@@ -79,20 +80,26 @@ def _parse_yes_no(value: str | None) -> float | None:
     return None
 
 
+def _coerce_cell(value):
+    if value is None:
+        return ""
+    if isinstance(value, (list, dict)):
+        try:
+            return json.dumps(value)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
 def _safe_display_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     safe = df.copy()
     # Streamlit 1.19 + pyarrow can choke on LargeUtf8. Force Python strings for display.
-    try:
-        return safe.astype(str)
-    except Exception:
-        for col in safe.columns:
-            try:
-                safe[col] = safe[col].astype(str)
-            except Exception:
-                safe[col] = safe[col].map(lambda value: str(value))
-        return safe
+    for col in safe.columns:
+        if pd.api.types.is_object_dtype(safe[col]) or pd.api.types.is_string_dtype(safe[col]):
+            safe[col] = safe[col].map(_coerce_cell)
+    return safe.astype(object)
 
 
 def _safe_editor_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -101,11 +108,8 @@ def _safe_editor_df(df: pd.DataFrame) -> pd.DataFrame:
     safe = df.copy()
     for col in safe.columns:
         if pd.api.types.is_object_dtype(safe[col]) or pd.api.types.is_string_dtype(safe[col]):
-            try:
-                safe[col] = safe[col].astype(str)
-            except Exception:
-                safe[col] = safe[col].map(lambda value: str(value))
-    return safe
+            safe[col] = safe[col].map(_coerce_cell)
+    return safe.astype(object)
 
 
 def _pill(label: str, kind: str) -> None:
