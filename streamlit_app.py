@@ -238,6 +238,15 @@ def _secret_get(key: str) -> str | None:
         return None
 
 
+def _data_editor(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    if hasattr(st, "data_editor"):
+        return st.data_editor(df, **kwargs)
+    if hasattr(st, "experimental_data_editor"):
+        return st.experimental_data_editor(df, **kwargs)
+    st.warning("Editable tables are not supported in this Streamlit version.")
+    return df
+
+
 def _require_login() -> bool:
     st.sidebar.header("Login")
     user = st.sidebar.text_input("Username")
@@ -820,7 +829,7 @@ with admin_tabs[2]:
     los_df = pd.DataFrame(los_rows)
     if not los_df.empty:
         los_df = los_df[["procedure_group", "avg_icu_los_hours", "avg_hdu_los_hours", "comments", "last_reviewed"]]
-    edited = st.data_editor(los_df, num_rows="dynamic", use_container_width=True)
+    edited = _data_editor(los_df, num_rows="dynamic", use_container_width=True)
     if st.button("Save LOS reference"):
         save_procedure_los(OPS_DB_PATH, edited.to_dict(orient="records"), st.session_state.get("current_user"))
         st.success("LOS reference updated.")
@@ -831,7 +840,7 @@ with admin_tabs[3]:
     theatre_df = pd.DataFrame(theatre_rows)
     if not theatre_df.empty:
         theatre_df = theatre_df[["case_date", "procedure_group", "expected_arrival_time", "icu_need", "is_emergency", "notes"]]
-    edited = st.data_editor(theatre_df, num_rows="dynamic", use_container_width=True)
+    edited = _data_editor(theatre_df, num_rows="dynamic", use_container_width=True)
     if st.button("Save theatre schedule"):
         save_theatre_schedule(OPS_DB_PATH, edited.to_dict(orient="records"), st.session_state.get("current_user"))
         st.success("Theatre schedule updated.")
