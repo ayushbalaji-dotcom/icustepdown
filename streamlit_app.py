@@ -219,6 +219,54 @@ def _render_ward_view() -> None:
     _render_bed_board(read_only=True)
 
     patients = list_patient_operational_status(OPS_DB_PATH)
+    capacity = get_latest_capacity(OPS_DB_PATH) or {}
+    icu_total = int(capacity.get("icu_beds") or 0)
+    bed_rows = []
+    patient_queue = list(patients)
+    for idx in range(max(icu_total, len(patient_queue))):
+        patient = patient_queue[idx] if idx < len(patient_queue) else None
+        bed_label = f"ICU-{idx + 1}" if idx < icu_total else "ICU-Overflow"
+        if not patient:
+            bed_rows.append(
+                {
+                    "Bed": bed_label,
+                    "Patient": "--",
+                    "Readiness": "--",
+                    "Transfer feasibility": "--",
+                    "Status": "Free",
+                    "Waiting reason": "--",
+                }
+            )
+            continue
+        readiness = patient.get("readiness_status") or "--"
+        feasibility = patient.get("transfer_feasibility") or "--"
+        blockers = patient.get("operational_blockers") or []
+        waiting_reason = ", ".join(blockers) if blockers else ("Awaiting ward bed" if feasibility == "No" else "--")
+        if feasibility == "Yes":
+            status = "Clinically ready"
+        elif readiness == "GREEN":
+            status = "Ready but blocked"
+        elif readiness == "AMBER":
+            status = "Borderline"
+        else:
+            status = "Not ready"
+        bed_rows.append(
+            {
+                "Bed": bed_label,
+                "Patient": patient.get("patient_id") or "--",
+                "Readiness": readiness,
+                "Transfer feasibility": feasibility,
+                "Status": status,
+                "Waiting reason": waiting_reason,
+            }
+        )
+
+    st.subheader("ICU bed status")
+    if icu_total == 0:
+        st.info("Set ICU bed count in Operational management → Capacity Setup to see the bed table.")
+    else:
+        st.dataframe(_safe_display_df(pd.DataFrame(bed_rows)), use_container_width=True, hide_index=True)
+
     icu_candidates = [p for p in patients if p.get("readiness_status") in {"GREEN", "AMBER"}]
     ward_candidates = [p for p in patients if p.get("destination_recommendation") == "Ward"]
     blocked = [p for p in patients if p.get("transfer_feasibility") == "No"]
