@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import sqlite3
@@ -194,7 +195,8 @@ def init_db(db_path: str) -> None:
                 insulin_infusion REAL,
                 pacing_active REAL,
                 rhythm TEXT,
-                imaging_summary TEXT
+                imaging_summary TEXT,
+                custom_data TEXT
             )
             """
         )
@@ -216,6 +218,7 @@ def init_db(db_path: str) -> None:
             """
         )
         _ensure_column(cur, "raw_icu_data", "rhythm", "TEXT")
+        _ensure_column(cur, "raw_icu_data", "custom_data", "TEXT")
         conn.commit()
         _migrate_legacy_ids(conn, key)
     finally:
@@ -295,8 +298,16 @@ def append_row(db_path: str, nhs_number: str, row: Dict[str, Any]) -> str:
         cur = conn.cursor()
         encounter_id = get_latest_encounter(db_path, nhs) or start_encounter(db_path, nhs)
         row = dict(row)
+        custom_payload = {
+            key: value
+            for key, value in list(row.items())
+            if str(key).startswith("custom_") and value is not None and value != ""
+        }
+        for key in list(custom_payload):
+            row.pop(key, None)
         row["patient_id"] = patient_key
         row["encounter_id"] = encounter_id
+        row["custom_data"] = json.dumps(custom_payload) if custom_payload else None
         columns = [
             "encounter_id",
             "patient_id",
@@ -325,6 +336,7 @@ def append_row(db_path: str, nhs_number: str, row: Dict[str, Any]) -> str:
             "pacing_active",
             "rhythm",
             "imaging_summary",
+            "custom_data",
         ]
         values = [row.get(c) for c in columns]
         placeholders = ",".join(["?"] * len(columns))
@@ -352,7 +364,19 @@ def load_rows(db_path: str, nhs_number: str) -> list[Dict[str, Any]]:
             (encounter_id,),
         )
         cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        results = []
+        for row in cur.fetchall():
+            item = dict(zip(cols, row))
+            custom_data = item.pop("custom_data", None)
+            if custom_data:
+                try:
+                    parsed = json.loads(custom_data)
+                    if isinstance(parsed, dict):
+                        item.update(parsed)
+                except Exception:
+                    pass
+            results.append(item)
+        return results
     finally:
         conn.close()
 

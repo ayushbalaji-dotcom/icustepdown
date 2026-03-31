@@ -1,5 +1,5 @@
 import os
-from typing import Any, List
+from typing import Any, Dict, List
 from datetime import datetime
 import tempfile
 
@@ -30,9 +30,11 @@ from icu_stepdown.ops_store import (
     get_latest_bed_inventory,
     get_latest_capability,
     get_latest_capacity,
+    get_latest_custom_variable_values,
     get_latest_rules,
     get_latest_staffing,
     list_audit_log,
+    list_custom_variable_definitions,
     list_patient_operational_status,
     list_procedure_los,
     list_theatre_schedule,
@@ -40,6 +42,8 @@ from icu_stepdown.ops_store import (
     save_bed_inventory,
     save_capacity,
     save_capability,
+    save_custom_variable_definitions,
+    save_custom_variable_values,
     save_procedure_los,
     save_staffing,
     save_theatre_schedule,
@@ -171,6 +175,7 @@ def _render_bed_board(read_only: bool = False) -> None:
     cap_cols[1].metric("HDU beds", latest_capacity.get("hdu_beds", "--"), f"Free {_free_beds(latest_capacity.get('hdu_beds'), bed_inventory.get('hdu_occupied'))}")
     cap_cols[2].metric("Ward beds", latest_capacity.get("ward_beds", "--"), f"Free {_free_beds(latest_capacity.get('ward_beds'), bed_inventory.get('ward_occupied'))}")
     cap_cols[3].metric("Telemetry beds", latest_capacity.get("telemetry_beds", "--"), f"Free {_free_beds(latest_capacity.get('telemetry_beds'), bed_inventory.get('telemetry_occupied'))}")
+    _render_custom_variable_summary(OPS_DB_PATH, "ward", "Ward-specific variables")
 
     if not read_only:
         with st.form("bed_inventory_form"):
@@ -360,6 +365,176 @@ def _data_editor(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
     return df
 
 
+def _parse_custom_boolean(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if pd.isna(value):
+            return None
+        return bool(int(value))
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y"}:
+        return True
+    if text in {"0", "false", "no", "n"}:
+        return False
+    return None
+
+
+def _humanize_custom_slug(slug: str) -> str:
+    text = str(slug or "").strip()
+    if text.startswith("custom_"):
+        text = text[len("custom_") :]
+    return text.replace("_", " ").title() or "Custom variable"
+
+
+def _custom_definition_editor_df(definitions: list[dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for item in definitions:
+        rows.append(
+            {
+                "label": item.get("label") or "",
+                "slug": item.get("slug") or "",
+                "data_type": item.get("data_type") or "number",
+                "unit": item.get("unit") or "",
+                "notes": item.get("notes") or "",
+                "active": bool(item.get("active", True)),
+            }
+        )
+    return pd.DataFrame(rows, columns=["label", "slug", "data_type", "unit", "notes", "active"])
+
+
+def _custom_definition_column_config(scope: str) -> Dict[str, Any]:
+    if not hasattr(st, "column_config"):
+        return {}
+    options = ["number", "boolean"] if scope == "clinical" else ["number", "boolean", "text"]
+    return {
+        "label": st.column_config.TextColumn("Label", required=True),
+        "slug": st.column_config.TextColumn("Code", help="Optional stable machine name. If blank, it is derived from the label."),
+        "data_type": st.column_config.SelectboxColumn("Type", options=options, required=True),
+        "unit": st.column_config.TextColumn("Unit"),
+        "notes": st.column_config.TextColumn("Notes"),
+        "active": st.column_config.CheckboxColumn("Active", default=True),
+    }
+
+
+def _render_custom_value_inputs(
+    definitions: list[dict[str, Any]],
+    existing_values: dict[str, Any],
+    prefix: str,
+) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    if not definitions:
+        return values
+
+    column_count = 1 if len(definitions) == 1 else 2 if len(definitions) <= 4 else 3
+    columns = st.columns(column_count)
+    for idx, definition in enumerate(definitions):
+        slug = str(definition.get("slug") or "")
+        label = str(definition.get("label") or slug or "Variable")
+        if definition.get("unit"):
+            label = f"{label} ({definition.get('unit')})"
+        help_text = definition.get("notes") or None
+        current_value = existing_values.get(slug)
+        with columns[idx % column_count]:
+            if definition.get("data_type") == "boolean":
+                parsed = _parse_custom_boolean(current_value)
+                options = ["", "Yes", "No"]
+                index = 0 if parsed is None else 1 if parsed else 2
+                values[slug] = st.selectbox(
+                    label,
+                    options,
+                    index=index,
+                    key=f"{prefix}_{slug}",
+                    help=help_text,
+                )
+            else:
+                values[slug] = st.text_input(
+                    label,
+                    value="" if current_value is None else str(current_value),
+                    key=f"{prefix}_{slug}",
+                    help=help_text,
+                )
+    return values
+
+
+def _parse_custom_value_payload(definitions: list[dict[str, Any]], raw_values: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for definition in definitions:
+        slug = str(definition.get("slug") or "")
+        if not slug:
+            continue
+        raw_value = raw_values.get(slug)
+        data_type = str(definition.get("data_type") or "number")
+        if data_type == "boolean":
+            payload[slug] = _parse_yes_no(raw_value)
+        elif data_type == "number":
+            payload[slug] = _parse_optional_float(definition.get("label") or slug, raw_value)
+        else:
+            text = str(raw_value).strip() if raw_value is not None else ""
+            payload[slug] = text or None
+    return payload
+
+
+def _format_custom_value(value: Any, data_type: str, unit: str | None = None) -> str:
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return "--"
+    if data_type == "boolean":
+        parsed = _parse_custom_boolean(value)
+        if parsed is None:
+            return str(value)
+        return "Yes" if parsed else "No"
+    if data_type == "number":
+        try:
+            numeric = float(value)
+            if numeric.is_integer():
+                text = str(int(numeric))
+            else:
+                text = f"{numeric:.2f}".rstrip("0").rstrip(".")
+        except Exception:
+            text = str(value)
+        return f"{text} {unit}".strip() if unit else text
+    return str(value)
+
+
+def _render_custom_variable_summary(db_path: str, scope: str, title: str) -> None:
+    definitions = list_custom_variable_definitions(db_path, scope, active_only=True)
+    if not definitions:
+        return
+    values = get_latest_custom_variable_values(db_path, scope)
+    rows = [
+        {
+            "Variable": definition.get("label") or definition.get("slug"),
+            "Value": _format_custom_value(values.get(str(definition.get("slug") or "")), str(definition.get("data_type") or "text"), definition.get("unit")),
+            "Notes": definition.get("notes") or "",
+        }
+        for definition in definitions
+    ]
+    st.markdown(f"**{title}**")
+    st.dataframe(_safe_display_df(pd.DataFrame(rows)), use_container_width=True, hide_index=True)
+
+
+def _custom_model_warning(model_state: dict[str, Any], definitions: list[dict[str, Any]]) -> str | None:
+    active_slugs = sorted(str(item.get("slug") or "") for item in definitions if item.get("active") and item.get("slug"))
+    trained_slugs = sorted(str(item) for item in (model_state.get("custom_clinical_variables") or []))
+    if not active_slugs or not trained_slugs:
+        return None
+
+    label_map = {str(item.get("slug")): str(item.get("label") or _humanize_custom_slug(str(item.get("slug")))) for item in definitions if item.get("slug")}
+    missing = [label_map.get(slug, _humanize_custom_slug(slug)) for slug in active_slugs if slug not in trained_slugs]
+    extra = [label_map.get(slug, _humanize_custom_slug(slug)) for slug in trained_slugs if slug not in active_slugs]
+    if not missing and not extra:
+        return None
+
+    parts = []
+    if missing:
+        parts.append(f"not in the active model: {', '.join(missing)}")
+    if extra:
+        parts.append(f"still present in the active model: {', '.join(extra)}")
+    return "Clinical custom variables changed since the active model was trained; retrain and activate a new model. " + " | ".join(parts)
+
+
 def _require_login() -> bool:
     st.sidebar.header("Login")
     user = st.sidebar.text_input("Username")
@@ -436,10 +611,12 @@ def _score_from_db(db_path: str, cfg, model_path: str | None, hard_stops_only: b
     return {"status": "ok", "dashboard": latest, "warning": warning, "model_status": model_state}
 
 
-def _render_model_training_sidebar(config_path: str, base_dir: str = "database") -> None:
+def _render_model_training_sidebar(config_path: str, base_dir: str = "database", ops_db_path: str | None = None) -> None:
     os.makedirs(base_dir, exist_ok=True)
     model_override = st.session_state.get("model_path_override", "")
     model_state = runtime_model_status(model_override or None, base_dir)
+    clinical_definitions = list_custom_variable_definitions(ops_db_path, "clinical", active_only=True) if ops_db_path else []
+    retrain_warning = _custom_model_warning(model_state, clinical_definitions)
 
     with st.sidebar.expander("Model training", expanded=False):
         if model_state.get("available"):
@@ -451,8 +628,15 @@ def _render_model_training_sidebar(config_path: str, base_dir: str = "database")
                     f"Train rows: {metrics.get('train_rows', '--')} | "
                     f"Test rows: {metrics.get('test_rows', '--')}"
                 )
+            trained_custom = model_state.get("custom_clinical_variables") or []
+            if trained_custom:
+                st.caption("Model custom clinical variables: " + ", ".join(_humanize_custom_slug(item) for item in trained_custom))
         else:
             st.caption("No active model available. ML scoring will fail closed until a model is trained or loaded.")
+        if clinical_definitions:
+            st.caption("Configured clinical custom variables: " + ", ".join(item.get("label") or _humanize_custom_slug(item.get("slug")) for item in clinical_definitions))
+        if retrain_warning:
+            st.warning(retrain_warning)
 
         uploaded = st.file_uploader("Training workbook (.xlsx)", type=["xlsx"], key="training_workbook")
         model_name = st.text_input("Model name", value=st.session_state.get("training_model_name", ""), key="training_model_name")
@@ -529,7 +713,7 @@ if model_state.get("available"):
 else:
     st.sidebar.caption("No runtime model available. Scoring will fail closed unless ML is disabled.")
 hard_stops_only = st.sidebar.checkbox("Hard-stops only (no ML)", key="hard_stops_only")
-_render_model_training_sidebar("configs/default.yaml", "database")
+_render_model_training_sidebar("configs/default.yaml", "database", OPS_DB_PATH)
 nav = st.sidebar.radio(
     "Navigation",
     ["Operational management", "Ward view", "Clinical readiness assessment"],
@@ -774,6 +958,11 @@ if nav == "Clinical readiness assessment":
     if not preop_ready:
         st.info("Enter pre-op characteristics to enable hourly data entry.")
 
+    clinical_custom_definitions = list_custom_variable_definitions(OPS_DB_PATH, "clinical", active_only=True)
+    clinical_retrain_warning = _custom_model_warning(model_state, clinical_custom_definitions)
+    if clinical_custom_definitions and clinical_retrain_warning:
+        st.warning(clinical_retrain_warning)
+
     st.subheader("Hourly data entry")
     with st.form("data_entry"):
         ts_col1, ts_col2 = st.columns(2)
@@ -808,6 +997,14 @@ if nav == "Clinical readiness assessment":
         insulin_infusion = st.selectbox("Insulin infusion", ["", "Yes", "No"])
         rhythm = st.selectbox("Rhythm", ["", "Sinus", "AF", "Pacing required"])
         imaging_summary = st.text_area("Imaging summary (optional)")
+        custom_clinical_raw_values: dict[str, Any] = {}
+        if clinical_custom_definitions:
+            st.markdown("**Local clinical variables**")
+            custom_clinical_raw_values = _render_custom_value_inputs(
+                clinical_custom_definitions,
+                {},
+                "clinical_entry",
+            )
         submitted = st.form_submit_button("Add hourly data")
 
         if submitted:
@@ -843,6 +1040,7 @@ if nav == "Clinical readiness assessment":
                     "rhythm": rhythm or None,
                     "imaging_summary": imaging_summary or None,
                 }
+                row.update(_parse_custom_value_payload(clinical_custom_definitions, custom_clinical_raw_values))
                 append_row(st.session_state.db_path, st.session_state.nhs_number, row)
                 st.success("Saved hourly data.")
             except Exception as e:
@@ -1037,6 +1235,7 @@ if nav == "Operational management":
         "Procedure LOS Setup",
         "Theatre and Incoming Demand",
         "Bed Board",
+        "Custom Variables",
         "Rules and Local Pathways",
         "Audit and Overrides",
     ])
@@ -1174,6 +1373,85 @@ if nav == "Operational management":
         _render_bed_board(read_only=False)
     
     with admin_tabs[5]:
+        st.markdown("**Ward and site variables**")
+        st.caption("Define local operational variables such as male/female bay splits, protected beds, or ward-specific constraints.")
+        ward_definitions = list_custom_variable_definitions(OPS_DB_PATH, "ward")
+        ward_editor_kwargs: dict[str, Any] = {
+            "num_rows": "dynamic",
+            "use_container_width": True,
+            "key": "ward_custom_definition_editor",
+        }
+        ward_column_config = _custom_definition_column_config("ward")
+        if ward_column_config:
+            ward_editor_kwargs["column_config"] = ward_column_config
+        ward_edited = _data_editor(_custom_definition_editor_df(ward_definitions), **ward_editor_kwargs)
+        if st.button("Save ward variable definitions", key="save_ward_variable_definitions"):
+            save_custom_variable_definitions(
+                OPS_DB_PATH,
+                "ward",
+                ward_edited.to_dict(orient="records"),
+                st.session_state.get("current_user"),
+            )
+            st.success("Ward variable definitions updated.")
+
+        ward_active_definitions = list_custom_variable_definitions(OPS_DB_PATH, "ward", active_only=True)
+        st.markdown("**Current ward/site values**")
+        if ward_active_definitions:
+            ward_existing_values = get_latest_custom_variable_values(OPS_DB_PATH, "ward")
+            with st.form("ward_custom_values_form"):
+                ward_raw_values = _render_custom_value_inputs(ward_active_definitions, ward_existing_values, "ward_value")
+                ward_values_submitted = st.form_submit_button("Save ward variable values")
+                if ward_values_submitted:
+                    try:
+                        save_custom_variable_values(
+                            OPS_DB_PATH,
+                            "ward",
+                            _parse_custom_value_payload(ward_active_definitions, ward_raw_values),
+                            st.session_state.get("current_user"),
+                        )
+                        st.success("Ward variable values updated.")
+                    except Exception as e:
+                        st.error(str(e))
+            _render_custom_variable_summary(OPS_DB_PATH, "ward", "Current ward/site configuration")
+        else:
+            st.info("Add at least one active ward/site variable to capture local operational detail.")
+
+        st.markdown("---")
+        st.markdown("**Clinical readiness variables**")
+        st.caption("Define additional numeric or boolean patient variables to capture in hourly data. These fields are added to feature generation and will be used by the ML model after retraining.")
+        clinical_definitions = list_custom_variable_definitions(OPS_DB_PATH, "clinical")
+        clinical_editor_kwargs: dict[str, Any] = {
+            "num_rows": "dynamic",
+            "use_container_width": True,
+            "key": "clinical_custom_definition_editor",
+        }
+        clinical_column_config = _custom_definition_column_config("clinical")
+        if clinical_column_config:
+            clinical_editor_kwargs["column_config"] = clinical_column_config
+        clinical_edited = _data_editor(_custom_definition_editor_df(clinical_definitions), **clinical_editor_kwargs)
+        if st.button("Save clinical variable definitions", key="save_clinical_variable_definitions"):
+            save_custom_variable_definitions(
+                OPS_DB_PATH,
+                "clinical",
+                clinical_edited.to_dict(orient="records"),
+                st.session_state.get("current_user"),
+            )
+            st.success("Clinical variable definitions updated.")
+
+        clinical_active_definitions = list_custom_variable_definitions(OPS_DB_PATH, "clinical", active_only=True)
+        if clinical_active_definitions:
+            st.caption("Active clinical variables: " + ", ".join(item.get("label") or _humanize_custom_slug(item.get("slug")) for item in clinical_active_definitions))
+            retrain_warning = _custom_model_warning(model_state, clinical_active_definitions)
+            if retrain_warning:
+                st.warning(retrain_warning)
+            elif model_state.get("custom_clinical_variables"):
+                st.success("The active model is aligned with the current clinical custom variable set.")
+            else:
+                st.info("Retrain and activate a model once labelled training data includes these variables.")
+        else:
+            st.caption("No active clinical custom variables configured.")
+
+    with admin_tabs[6]:
         latest_rules = get_latest_rules(OPS_DB_PATH) or {}
         with st.form("rules_form"):
             min_telemetry = st.checkbox("Minimum telemetry availability required for certain patients", value=bool(latest_rules.get("min_telemetry_required") or 0))
@@ -1202,7 +1480,7 @@ if nav == "Operational management":
                 )
                 st.success("Rules updated.")
     
-    with admin_tabs[6]:
+    with admin_tabs[7]:
         audit_rows = list_audit_log(OPS_DB_PATH, limit=200)
         if audit_rows:
             st.dataframe(_safe_display_df(pd.DataFrame(audit_rows)))

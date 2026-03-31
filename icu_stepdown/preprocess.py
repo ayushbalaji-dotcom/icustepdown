@@ -74,6 +74,13 @@ def _map_oxygen_device(df: pd.DataFrame, cfg: Dict[str, Any], ql: QualityLogger)
     return df
 
 
+def _coerce_custom_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for col in df.columns:
+        if str(col).startswith("custom_"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
 def dedupe_and_sort(df: pd.DataFrame, ql: QualityLogger) -> pd.DataFrame:
     df = df.sort_values(["patient_id", "encounter_id", "timestamp"])
     # merge duplicates by last non-null wins
@@ -89,9 +96,9 @@ def dedupe_and_sort(df: pd.DataFrame, ql: QualityLogger) -> pd.DataFrame:
 
 def preprocess(df: pd.DataFrame, cfg: Dict[str, Any], ql: QualityLogger) -> pd.DataFrame:
     df = dedupe_and_sort(df, ql)
+    df = _coerce_custom_columns(df)
     df = _unit_normalize(df, cfg, ql)
     df = _clamp_plausible(df, cfg, ql)
     df = _map_oxygen_device(df, cfg, ql)
     return df
-
 

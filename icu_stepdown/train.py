@@ -8,6 +8,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import brier_score_loss, roc_auc_score
 from sklearn.naive_bayes import GaussianNB
 
+from .custom_features import resolve_feature_schema
 from .quality import QualityLogger
 from .split import split_encounters, calibration_split
 
@@ -112,7 +113,7 @@ def train_model(features: pd.DataFrame, outcomes: pd.DataFrame, cfg: Dict[str, A
     train_enc, cal_enc = calibration_split(train_enc, cfg["training"]["calib_holdout_frac"])
     train_enc, cal_enc, test_enc = _restore_training_class_coverage(data, train_enc, cal_enc, test_enc, ql)
 
-    feature_cols = cfg["feature_schema"]
+    feature_cols = resolve_feature_schema(cfg, features_df=features)
     for col in feature_cols:
         if col not in data.columns:
             data[col] = np.nan

@@ -3,6 +3,8 @@ from typing import Any, Dict
 import numpy as np
 import pandas as pd
 
+from .custom_features import resolve_feature_schema
+
 
 class BaselineCalibrator:
     def __init__(self, cfg: Dict[str, Any]) -> None:
@@ -80,7 +82,7 @@ class BaselineCalibrator:
 
 
 def build_baseline_bundle(features: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    feature_cols = cfg.get("feature_schema", [])
+    feature_cols = resolve_feature_schema(cfg, features_df=features)
     data = features.copy()
     for col in feature_cols:
         if col not in data.columns:

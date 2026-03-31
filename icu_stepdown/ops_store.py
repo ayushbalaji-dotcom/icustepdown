@@ -4,6 +4,8 @@ import sqlite3
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 
+from .custom_features import normalize_custom_variable_slug
+
 DEFAULT_PROCEDURE_GROUPS = [
     "CABG",
     "AVR",
@@ -25,6 +27,19 @@ def _ensure_column(cur: sqlite3.Cursor, table: str, column: str, col_type: str) 
     existing = {row[1] for row in cur.fetchall()}
     if column not in existing:
         cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y"}:
+        return True
+    if text in {"0", "false", "no", "n"}:
+        return False
+    return default
 
 
 def init_ops_db(db_path: str) -> None:
@@ -154,6 +169,37 @@ def init_ops_db(db_path: str) -> None:
                 notes TEXT,
                 updated_at TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS custom_variable_definitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                label TEXT NOT NULL,
+                data_type TEXT NOT NULL,
+                unit TEXT,
+                notes TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(scope, slug)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS custom_variable_values (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                value_text TEXT,
+                value_numeric REAL,
+                updated_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(scope, slug)
             )
             """
         )
@@ -367,6 +413,145 @@ def get_latest_bed_inventory(db_path: str) -> Optional[Dict[str, Any]]:
         return _fetch_latest(conn, "bed_inventory")
     finally:
         conn.close()
+
+
+def list_custom_variable_definitions(db_path: str, scope: str, active_only: bool = False) -> List[Dict[str, Any]]:
+    init_ops_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        query = "SELECT * FROM custom_variable_definitions WHERE scope = ?"
+        params: list[Any] = [scope]
+        if active_only:
+            query += " AND active = 1"
+        query += " ORDER BY label, slug"
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        results = [dict(zip(cols, row)) for row in rows]
+        for item in results:
+            item["active"] = bool(item.get("active"))
+        return results
+    finally:
+        conn.close()
+
+
+def save_custom_variable_definitions(db_path: str, scope: str, rows: Iterable[Dict[str, Any]], user: str | None) -> None:
+    init_ops_db(db_path)
+    now = _utc_now()
+    clean_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        label = str(row.get("label") or "").strip()
+        if not label:
+            continue
+        data_type = str(row.get("data_type") or "number").strip().lower()
+        if scope == "clinical" and data_type not in {"number", "boolean"}:
+            data_type = "number"
+        if scope == "ward" and data_type not in {"number", "boolean", "text"}:
+            data_type = "text"
+        slug_value = str(row.get("slug") or "").strip() or label
+        slug = normalize_custom_variable_slug(slug_value)
+        clean_rows.append(
+            {
+                "scope": scope,
+                "slug": slug,
+                "label": label,
+                "data_type": data_type,
+                "unit": str(row.get("unit") or "").strip() or None,
+                "notes": str(row.get("notes") or "").strip() or None,
+                "active": 1 if _as_bool(row.get("active", True), default=True) else 0,
+            }
+        )
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM custom_variable_definitions WHERE scope = ?", (scope,))
+        for row in clean_rows:
+            cur.execute(
+                """
+                INSERT INTO custom_variable_definitions
+                (scope, slug, label, data_type, unit, notes, active, updated_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["scope"],
+                    row["slug"],
+                    row["label"],
+                    row["data_type"],
+                    row["unit"],
+                    row["notes"],
+                    row["active"],
+                    now,
+                    now,
+                ),
+            )
+        keep_slugs = {row["slug"] for row in clean_rows}
+        if keep_slugs:
+            placeholders = ",".join(["?"] * len(keep_slugs))
+            cur.execute(
+                f"DELETE FROM custom_variable_values WHERE scope = ? AND slug NOT IN ({placeholders})",
+                [scope, *sorted(keep_slugs)],
+            )
+        else:
+            cur.execute("DELETE FROM custom_variable_values WHERE scope = ?", (scope,))
+        conn.commit()
+    finally:
+        conn.close()
+    log_audit(db_path, "update", "custom_variable_definitions", scope, f"Updated {scope} variable definitions", user)
+
+
+def get_latest_custom_variable_values(db_path: str, scope: str) -> Dict[str, Any]:
+    init_ops_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT slug, value_text, value_numeric FROM custom_variable_values WHERE scope = ? ORDER BY slug",
+            (scope,),
+        )
+        rows = cur.fetchall()
+        values: Dict[str, Any] = {}
+        for slug, value_text, value_numeric in rows:
+            values[str(slug)] = value_numeric if value_text in (None, "", "None") else value_text
+            if value_numeric is not None and (value_text is None or value_text == ""):
+                values[str(slug)] = value_numeric
+        return values
+    finally:
+        conn.close()
+
+
+def save_custom_variable_values(db_path: str, scope: str, payload: Dict[str, Any], user: str | None) -> None:
+    init_ops_db(db_path)
+    now = _utc_now()
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM custom_variable_values WHERE scope = ?", (scope,))
+        for slug, value in payload.items():
+            if value is None or (isinstance(value, str) and value.strip() == ""):
+                continue
+            value_text = None if isinstance(value, (int, float)) and not isinstance(value, bool) else str(value)
+            value_numeric = None
+            if isinstance(value, bool):
+                value_numeric = 1.0 if value else 0.0
+            else:
+                try:
+                    value_numeric = float(value)
+                except Exception:
+                    value_numeric = None
+            cur.execute(
+                """
+                INSERT INTO custom_variable_values
+                (scope, slug, value_text, value_numeric, updated_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (scope, slug, value_text, value_numeric, now, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    log_audit(db_path, "update", "custom_variable_values", scope, f"Updated {scope} variable values", user)
 
 
 def list_procedure_los(db_path: str) -> List[Dict[str, Any]]:

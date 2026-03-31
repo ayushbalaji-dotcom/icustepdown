@@ -6,6 +6,7 @@ from typing import Any, Dict
 import pandas as pd
 
 from .config import load_config
+from .custom_features import custom_raw_columns, custom_raw_columns_from_features
 from .features import compute_features
 from .io_excel import read_excel_sheets, write_excel_preserve
 from .labels import build_labels
@@ -44,8 +45,10 @@ def _load_training_inputs(input_path: str, cfg: Dict[str, Any], ql: QualityLogge
         raw = preprocess(raw, cfg, ql)
         features = compute_features(raw, cfg, ql)
         source_meta["raw_row_count"] = int(len(raw))
+        source_meta["custom_clinical_variables"] = custom_raw_columns(raw)
     elif "features_4h" in sheets:
         features = sheets["features_4h"].copy()
+        source_meta["custom_clinical_variables"] = custom_raw_columns_from_features(features)
     else:
         raise ValueError("Training workbook must contain raw_icu_data or features_4h")
 
@@ -136,6 +139,7 @@ def train_workbook(
                 "report_path": os.path.abspath(report_path),
                 "source_file": os.path.basename(input_path),
                 "summary": summary,
+                "custom_clinical_variables": source_meta.get("custom_clinical_variables", []),
             },
         )
 

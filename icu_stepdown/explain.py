@@ -3,9 +3,11 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
+from .custom_features import custom_feature_columns_from_features, custom_feature_label
 
-def _domain_groups() -> Dict[str, List[str]]:
-    return {
+
+def _domain_groups(features: pd.DataFrame | None = None) -> Dict[str, List[str]]:
+    groups = {
         "Haemodynamic": [
             "MAP_mean_4h",
             "MAP_sd_4h",
@@ -53,6 +55,11 @@ def _domain_groups() -> Dict[str, List[str]]:
             "insulin_infusion_latest",
         ],
     }
+    if features is not None:
+        custom_cols = custom_feature_columns_from_features(features)
+        if custom_cols:
+            groups["Custom clinical"] = custom_cols
+    return groups
 
 
 def _signal_templates() -> Dict[str, str]:
@@ -79,6 +86,19 @@ def _signal_templates() -> Dict[str, str]:
         "arterial_line_present_latest": "Arterial line present {value:.0f}",
         "insulin_infusion_latest": "Insulin infusion {value:.0f}",
     }
+
+
+def _custom_signal(feature_name: str, value: float) -> str:
+    label = custom_feature_label(feature_name)
+    if feature_name.endswith("_now"):
+        return f"{label} now {value:.2f}"
+    if feature_name.endswith("_mean_4h"):
+        return f"{label} mean 4h {value:.2f}"
+    if feature_name.endswith("_slope_4h"):
+        return f"{label} slope {value:.3f} per hr"
+    if feature_name.endswith("_missing_4h"):
+        return f"{label} missing 4h {value:.0f}"
+    return f"{label} {value:.2f}"
 
 
 def _normal_signals(row: pd.Series, cfg: Dict[str, Any]) -> List[str]:
@@ -114,7 +134,7 @@ def compute_limiting_factor_and_signals(
     calibrator = model_bundle["calibrator"]
     base = calibrator.predict_proba(X)[:, 1]
 
-    domain_groups = _domain_groups()
+    domain_groups = _domain_groups(features)
     drops = {}
     for domain, cols in domain_groups.items():
         X_occluded = X.copy()
@@ -146,6 +166,8 @@ def compute_limiting_factor_and_signals(
                     tpl = template.get(feat)
                     if tpl:
                         sigs.append(tpl.format(value=float(features.iloc[i][feat])))
+                    elif feat.startswith("custom_"):
+                        sigs.append(_custom_signal(feat, float(features.iloc[i][feat])))
                 if len(sigs) >= 3:
                     break
         else:

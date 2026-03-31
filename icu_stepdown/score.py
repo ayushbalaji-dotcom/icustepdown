@@ -81,6 +81,7 @@ def _deterioration_label(limiting_factor: str | Any, hard_stop_reason_summary: s
         "Renal-Perfusion": "Perfusion deterioration",
         "Neuro-Infection": "Neurological deterioration",
         "Dependency": "Dependency-related deterioration",
+        "Custom clinical": "Custom clinical deterioration",
     }
     return mapping.get(str(limiting_factor or ""))
 

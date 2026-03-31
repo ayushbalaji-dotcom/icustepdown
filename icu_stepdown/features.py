@@ -4,6 +4,7 @@ from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 
+from .custom_features import custom_raw_columns
 from .quality import QualityLogger
 
 
@@ -108,6 +109,7 @@ def _compute_feature_rows(
     cfg: Dict[str, Any],
     patient_id: Any,
     encounter_id: Any,
+    custom_cols: List[str],
 ) -> List[Dict[str, Any]]:
     min_points = int(cfg.get("min_points", 4))
     windows = cfg.get("windows_hours", {})
@@ -220,6 +222,14 @@ def _compute_feature_rows(
         feats["resp_missing_4h"] = 1.0 if (window_vitals["FiO2"].dropna().empty and window_vitals["resp_support_level"].dropna().empty) else 0.0
         feats["map_missing_4h"] = 1.0 if window_vitals["MAP"].dropna().shape[0] < min_points else 0.0
 
+        for col in custom_cols:
+            if col not in enc_df.columns:
+                continue
+            feats[f"{col}_now"] = _last_value(window_vitals[col])
+            feats[f"{col}_mean_4h"] = _mean(window_vitals[col], 1)
+            feats[f"{col}_slope_4h"] = _slope(window_vitals[col], window_vitals["timestamp"])
+            feats[f"{col}_missing_4h"] = 1.0 if window_vitals[col].dropna().empty else 0.0
+
         rows.append(feats)
 
     return rows
@@ -238,13 +248,14 @@ def compute_features(df: pd.DataFrame, cfg: Dict[str, Any], ql: QualityLogger) -
     rows = []
     for (patient_id, encounter_id), enc_df in df.groupby(["patient_id", "encounter_id"]):
         enc_df = enc_df.sort_values("timestamp")
+        detected_custom_cols = custom_raw_columns(enc_df)
         score_times = _start_times(enc_df, cfg)
         if not score_times:
             continue
-        rows.extend(_compute_feature_rows(enc_df, score_times, cfg, patient_id, encounter_id))
+        rows.extend(_compute_feature_rows(enc_df, score_times, cfg, patient_id, encounter_id, detected_custom_cols))
 
     feat_df = pd.DataFrame(rows)
-    ql.add("INFO", "features_computed", count=int(feat_df.shape[0]))
+    ql.add("INFO", "features_computed", count=int(feat_df.shape[0]), custom_columns=custom_raw_columns(df))
     return feat_df
 
 
@@ -261,10 +272,11 @@ def compute_features_latest(df: pd.DataFrame, cfg: Dict[str, Any], ql: QualityLo
     rows = []
     for (patient_id, encounter_id), enc_df in df.groupby(["patient_id", "encounter_id"]):
         enc_df = enc_df.sort_values("timestamp")
+        detected_custom_cols = custom_raw_columns(enc_df)
         score_time = enc_df["timestamp"].max()
         if pd.isna(score_time):
             continue
-        rows.extend(_compute_feature_rows(enc_df, [score_time], cfg, patient_id, encounter_id))
+        rows.extend(_compute_feature_rows(enc_df, [score_time], cfg, patient_id, encounter_id, detected_custom_cols))
 
     feat_df = pd.DataFrame(rows)
     ql.add("INFO", "features_computed", count=int(feat_df.shape[0]), mode="latest")
