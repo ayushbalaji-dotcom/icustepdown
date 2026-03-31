@@ -14,6 +14,12 @@ const scoreBtn = document.getElementById('scoreBtn');
 const toast = document.getElementById('toast');
 const toastMessage = document.getElementById('toastMessage');
 const toastClose = document.getElementById('toastClose');
+const trainingFileInput = document.getElementById('trainingFile');
+const trainingModelNameInput = document.getElementById('trainingModelName');
+const trainModelBtn = document.getElementById('trainModelBtn');
+const trainingStatus = document.getElementById('trainingStatus');
+const modelStatus = document.getElementById('modelStatus');
+const modelMetrics = document.getElementById('modelMetrics');
 
 const trafficLight = document.getElementById('trafficLight');
 const iriValue = document.getElementById('iriValue');
@@ -76,6 +82,58 @@ function renderDomains(domainFlags) {
     item.appendChild(badge);
     domainList.appendChild(item);
   });
+}
+
+async function refreshModelStatus() {
+  const res = await fetch('/api/model-status');
+  const data = await res.json();
+  const model = data.model || {};
+  if (data.status === 'ok' && model.available) {
+    const source = model.source === 'explicit' ? 'Manual model' : 'Active trained model';
+    const name = model.model_path ? model.model_path.split('/').pop() : 'model';
+    modelStatus.textContent = `${source}: ${name}`;
+    const metrics = model.metrics || {};
+    modelMetrics.textContent = `Calibration ${metrics.calibration_method || 'n/a'} | train rows ${metrics.train_rows ?? '--'} | test rows ${metrics.test_rows ?? '--'}`;
+  } else {
+    modelStatus.textContent = 'No model loaded. Train a workbook or configure a model path before relying on ML scoring.';
+    modelMetrics.textContent = '';
+  }
+}
+
+async function trainModel() {
+  const file = trainingFileInput.files && trainingFileInput.files[0];
+  if (!file) {
+    trainingStatus.textContent = 'Select an .xlsx workbook first.';
+    return;
+  }
+
+  trainingStatus.textContent = 'Training model...';
+  trainModelBtn.disabled = true;
+  const form = new FormData();
+  form.append('training_file', file);
+  const modelName = String(trainingModelNameInput.value || '').trim();
+  if (modelName) {
+    form.append('model_name', modelName);
+  }
+
+  try {
+    const res = await fetch('/api/train', { method: 'POST', body: form });
+    const data = await res.json();
+    if (data.status !== 'ok') {
+      trainingStatus.textContent = data.error || 'Training failed.';
+      return;
+    }
+    const summary = data.summary || {};
+    trainingStatus.textContent = `Model trained. ${summary.positive_outcomes || 0} adverse and ${summary.negative_outcomes || 0} normal encounters processed.`;
+    await refreshModelStatus();
+    if (currentNhs) {
+      await refreshScore();
+    }
+  } catch (err) {
+    trainingStatus.textContent = 'Training failed.';
+  } finally {
+    trainModelBtn.disabled = false;
+  }
 }
 
 async function startPatient() {
@@ -290,7 +348,7 @@ async function refreshScore() {
   trafficLight.textContent = dash.traffic_light || 'RED';
   trafficLight.className = `traffic ${trafficClass(dash.traffic_light)}`;
   iriValue.textContent = dash.IRI != null ? Number(dash.IRI).toFixed(1) : '--';
-  trendValue.textContent = dash.trend || '--';
+  trendValue.textContent = dash.trend_label || dash.trend || '--';
   limitingValue.textContent = dash.limiting_factor || '--';
   if (data.warning === 'no_model_loaded_fail_closed') {
     signalsValue.textContent = 'No model loaded: showing fail-closed RED. Load a model to enable scoring.';
@@ -305,8 +363,10 @@ newEncounterBtn.addEventListener('click', startNewEncounter);
 savePreopBtn.addEventListener('click', savePreop);
 submitBtn.addEventListener('click', submitRow);
 scoreBtn.addEventListener('click', refreshScore);
+trainModelBtn.addEventListener('click', trainModel);
 toastClose.addEventListener('click', hideToast);
 setDefaultTimestamp();
+refreshModelStatus();
 
 function fillDummyValues() {
   const dummy = {

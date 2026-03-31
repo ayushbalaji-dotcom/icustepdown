@@ -133,6 +133,7 @@ xgboost_params:
   n_jobs: 4
 
 model:
+  backend: gaussian_nb
   calibration: isotonic
   min_calibration_samples: 200
   random_state: 42

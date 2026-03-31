@@ -61,6 +61,62 @@ def _trajectory(prev_iri: float, iri: float) -> str:
     return "→"
 
 
+def _deterioration_label(limiting_factor: str | Any, hard_stop_reason_summary: str | Any) -> str | None:
+    reason = str(hard_stop_reason_summary or "")
+    if "oxygen" in reason:
+        return "Respiratory deterioration"
+    if "pressor" in reason:
+        return "Haemodynamic deterioration"
+    if "lactate" in reason:
+        return "Perfusion deterioration"
+    if "bleeding" in reason:
+        return "Bleeding deterioration"
+    if "neuro" in reason:
+        return "Neurological deterioration"
+
+    mapping = {
+        "Respiratory": "Respiratory deterioration",
+        "Haemodynamic": "Haemodynamic deterioration",
+        "Bleeding": "Bleeding deterioration",
+        "Renal-Perfusion": "Perfusion deterioration",
+        "Neuro-Infection": "Neurological deterioration",
+        "Dependency": "Dependency-related deterioration",
+    }
+    return mapping.get(str(limiting_factor or ""))
+
+
+def _trend_label(
+    prev_iri: float,
+    iri: float,
+    trend_arrow: str,
+    traffic_light: str,
+    limiting_factor: str | Any,
+    any_hard_stop: bool,
+    hard_stop_reason_summary: str | Any,
+    data_quality_ok: bool,
+) -> str:
+    deterioration = _deterioration_label(limiting_factor, hard_stop_reason_summary)
+    if any_hard_stop and deterioration:
+        return deterioration
+    if deterioration:
+        if trend_arrow == "↑" and traffic_light != "RED":
+            return f"Improving {deterioration.lower()}"
+        return deterioration
+    if traffic_light == "GREEN" and data_quality_ok:
+        if pd.isna(prev_iri) or trend_arrow == "→":
+            return "Normal"
+        if trend_arrow == "↑":
+            return "Improving toward normal"
+        return "Drifting from normal"
+    if traffic_light == "AMBER" and not data_quality_ok:
+        return "Incomplete data"
+    if trend_arrow == "↓":
+        return "Non-specific deterioration"
+    if trend_arrow == "↑":
+        return "Improving"
+    return "Stable"
+
+
 def score_features(features: pd.DataFrame, model_bundle: Dict[str, Any], cfg: Dict[str, Any], ql: QualityLogger, force_schema: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, bool]:
     feature_cols = model_bundle["feature_columns"]
     missing = [c for c in feature_cols if c not in features.columns]
@@ -71,8 +127,8 @@ def score_features(features: pd.DataFrame, model_bundle: Dict[str, Any], cfg: Di
     for col in missing:
         features[col] = np.nan
 
-    means = pd.Series(model_bundle["training_means"])
-    X = features[feature_cols].fillna(means)
+    means = pd.Series(model_bundle["training_means"]).fillna(0.0)
+    X = features[feature_cols].fillna(means).fillna(0.0)
     calibrator = model_bundle["calibrator"]
     probs = calibrator.predict_proba(X)[:, 1]
     iri = (1 - probs) * 100
@@ -86,8 +142,6 @@ def score_features(features: pd.DataFrame, model_bundle: Dict[str, Any], cfg: Di
     any_hs_list = []
     data_quality_flags = []
     traffic = []
-    trajectories = []
-
     green_thr = cfg["thresholds"]["green_iri"]
     amber_thr = cfg["thresholds"]["amber_iri"]
 
@@ -123,6 +177,7 @@ def score_features(features: pd.DataFrame, model_bundle: Dict[str, Any], cfg: Di
     # trajectory
     scores = scores.sort_values(["patient_id", "encounter_id", "score_time"])
     scores["trend"] = "→"
+    scores["trend_label"] = "Stable"
     prev_iri = None
     prev_key = None
     for idx, row in scores.iterrows():
@@ -137,6 +192,26 @@ def score_features(features: pd.DataFrame, model_bundle: Dict[str, Any], cfg: Di
     signals_df, limiting = compute_limiting_factor_and_signals(features, model_bundle, cfg)
     scores = scores.merge(limiting, on=["patient_id", "encounter_id", "score_time"], how="left")
     scores = scores.merge(signals_df, on=["patient_id", "encounter_id", "score_time"], how="left")
+
+    prev_iri = np.nan
+    prev_key = None
+    for idx, row in scores.iterrows():
+        key = (row["patient_id"], row["encounter_id"])
+        if key != prev_key:
+            prev_iri = np.nan
+            prev_key = key
+        scores.at[idx, "trend_label"] = _trend_label(
+            prev_iri=prev_iri,
+            iri=row["IRI"],
+            trend_arrow=row["trend"],
+            traffic_light=row["traffic_light"],
+            limiting_factor=row.get("limiting_factor"),
+            any_hard_stop=bool(row["ANY_HARD_STOP"]),
+            hard_stop_reason_summary=row.get("hard_stop_reason_summary"),
+            data_quality_ok=bool(row["data_quality_ok_for_green"]),
+        )
+        prev_iri = row["IRI"]
+
     scores["suggested_action"] = scores["traffic_light"].map({
         "GREEN": "Plan step-down: book HDU bed + prep structured handover",
         "AMBER": "Borderline: reassess in 2–4h (focus on limiting factor)",
@@ -154,6 +229,7 @@ def score_features(features: pd.DataFrame, model_bundle: Dict[str, Any], cfg: Di
         "traffic_light",
         "IRI",
         "trend",
+        "trend_label",
         "limiting_factor",
         "suggested_action",
         "signals",
@@ -201,8 +277,26 @@ def score_hard_stops_only(features: pd.DataFrame, cfg: Dict[str, Any], ql: Quali
     scores["traffic_light"] = traffic
 
     scores["trend"] = "→"
+    scores["trend_label"] = np.where(scores["ANY_HARD_STOP"], "Clinical deterioration", "Stable")
     scores["limiting_factor"] = np.where(scores["ANY_HARD_STOP"], "Hard stop triggered", "None")
     scores["signals"] = scores["hard_stop_reason_summary"].replace({"": "No hard stops triggered"})
+
+    for idx, row in scores.iterrows():
+        if row["ANY_HARD_STOP"]:
+            scores.at[idx, "trend_label"] = _trend_label(
+                prev_iri=np.nan,
+                iri=np.nan,
+                trend_arrow="→",
+                traffic_light=row["traffic_light"],
+                limiting_factor=row["limiting_factor"],
+                any_hard_stop=bool(row["ANY_HARD_STOP"]),
+                hard_stop_reason_summary=row["hard_stop_reason_summary"],
+                data_quality_ok=bool(row["data_quality_ok_for_green"]),
+            )
+        elif row["traffic_light"] == "GREEN":
+            scores.at[idx, "trend_label"] = "Normal"
+        elif not row["data_quality_ok_for_green"]:
+            scores.at[idx, "trend_label"] = "Incomplete data"
 
     scores["suggested_action"] = scores["traffic_light"].map({
         "GREEN": "Plan step-down: book HDU bed + prep structured handover",
@@ -220,6 +314,7 @@ def score_hard_stops_only(features: pd.DataFrame, cfg: Dict[str, Any], ql: Quali
         "traffic_light",
         "IRI",
         "trend",
+        "trend_label",
         "limiting_factor",
         "suggested_action",
         "signals",
@@ -240,6 +335,7 @@ def _fail_closed_dashboard(features: pd.DataFrame, ql: QualityLogger) -> Tuple[p
     dashboard["traffic_light"] = "RED"
     dashboard["IRI"] = np.nan
     dashboard["trend"] = "→"
+    dashboard["trend_label"] = "Unknown"
     dashboard["limiting_factor"] = "None"
     dashboard["suggested_action"] = "Not ready: escalate attention; do not prompt step-down"
     dashboard["signals"] = "Insufficient data to explain"
@@ -255,6 +351,7 @@ def _fail_closed_dashboard(features: pd.DataFrame, ql: QualityLogger) -> Tuple[p
     scores["data_quality_ok_for_green"] = False
     scores["traffic_light"] = "RED"
     scores["trend"] = "→"
+    scores["trend_label"] = "Unknown"
     scores["limiting_factor"] = "None"
     scores["suggested_action"] = "Not ready: escalate attention; do not prompt step-down"
     scores["signals"] = "Insufficient data to explain"

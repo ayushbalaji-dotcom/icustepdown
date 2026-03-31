@@ -1,6 +1,7 @@
 import os
 from typing import Any, List
 from datetime import datetime
+import tempfile
 
 import json
 import pandas as pd
@@ -14,6 +15,7 @@ import streamlit as st
 from icu_stepdown.auth import resolve_expected_credentials, validate_credentials
 from icu_stepdown.config import load_config
 from icu_stepdown.features import compute_features, compute_features_latest
+from icu_stepdown.model_store import resolve_runtime_model_path, runtime_model_status
 from icu_stepdown.ops_logic import (
     bed_priority_score,
     compute_destination_recommendation,
@@ -34,6 +36,7 @@ from icu_stepdown.ops_store import (
     list_patient_operational_status,
     list_procedure_los,
     list_theatre_schedule,
+    release_bed_assignment,
     save_bed_inventory,
     save_capacity,
     save_capability,
@@ -44,11 +47,20 @@ from icu_stepdown.ops_store import (
     seed_ops_data,
     upsert_patient_operational_status,
 )
-from icu_stepdown.patient_store import append_row, load_preop, load_rows, save_preop, start_encounter, pseudonymize_nhs
+from icu_stepdown.patient_store import (
+    append_row,
+    get_latest_encounter,
+    load_preop,
+    load_rows,
+    save_preop,
+    start_encounter,
+    pseudonymize_nhs,
+)
 from icu_stepdown.preprocess import preprocess
 from icu_stepdown.quality import QualityLogger
 from icu_stepdown.schema import validate_raw
 from icu_stepdown.score import score_features, _fail_closed_dashboard, score_hard_stops_only
+from icu_stepdown.training_service import train_workbook
 
 
 def _parse_timestamp(value: str | datetime) -> str:
@@ -125,6 +137,28 @@ def _free_beds(total: Any, occupied: Any) -> str:
         return "--"
 
 
+def _icu_bed_state(
+    capacity: dict,
+    bed_inventory: dict,
+    patient_ops: list,
+) -> tuple[int, list[str], list[str]]:
+    icu_total = int(capacity.get("icu_beds") or 0)
+    bed_labels = [f"ICU-{idx + 1}" for idx in range(icu_total)]
+    occupied = {item.get("bed_label") for item in patient_ops if item.get("bed_label")}
+    occupied_count = bed_inventory.get("icu_occupied")
+    try:
+        occupied_count = int(occupied_count) if occupied_count is not None else None
+    except Exception:
+        occupied_count = None
+    if occupied_count is not None:
+        for label in bed_labels:
+            if len(occupied) >= occupied_count:
+                break
+            occupied.add(label)
+    free_labels = [label for label in bed_labels if label not in occupied]
+    return icu_total, bed_labels, free_labels
+
+
 def _render_bed_board(read_only: bool = False) -> None:
     latest_capacity = get_latest_capacity(OPS_DB_PATH) or {}
     bed_inventory = get_latest_bed_inventory(OPS_DB_PATH) or {}
@@ -182,6 +216,12 @@ def _render_bed_board(read_only: bool = False) -> None:
                         note=note,
                         user=st.session_state.get("current_user"),
                     )
+                    if bed_label:
+                        release_bed_assignment(
+                            OPS_DB_PATH,
+                            bed_label,
+                            st.session_state.get("current_user"),
+                        )
                     st.success(note)
                 except Exception as e:
                     st.error(str(e))
@@ -373,15 +413,17 @@ def _score_from_db(db_path: str, cfg, model_path: str | None, hard_stops_only: b
     if features.empty:
         return {"status": "insufficient_data"}
     model_bundle = None
+    model_state = runtime_model_status(model_path or None, "database")
     if hard_stops_only:
         scores, _, dashboard, _ = score_hard_stops_only(features, cfg, ql)
         warning = "hard_stops_only"
     else:
-        if model_path and os.path.exists(model_path):
+        runtime_model_path = resolve_runtime_model_path(model_path or None, "database")
+        if runtime_model_path and os.path.exists(runtime_model_path):
             try:
                 from icu_stepdown.train import load_model_bundle
 
-                model_bundle = load_model_bundle(model_path)
+                model_bundle = load_model_bundle(runtime_model_path)
             except Exception:
                 model_bundle = None
         if model_bundle is None:
@@ -391,7 +433,64 @@ def _score_from_db(db_path: str, cfg, model_path: str | None, hard_stops_only: b
             scores, _, dashboard, _ = score_features(features, model_bundle, cfg, ql, force_schema=True)
             warning = None
     latest = dashboard.iloc[0].to_dict() if not dashboard.empty else {}
-    return {"status": "ok", "dashboard": latest, "warning": warning}
+    return {"status": "ok", "dashboard": latest, "warning": warning, "model_status": model_state}
+
+
+def _render_model_training_sidebar(config_path: str, base_dir: str = "database") -> None:
+    os.makedirs(base_dir, exist_ok=True)
+    model_override = st.session_state.get("model_path_override", "")
+    model_state = runtime_model_status(model_override or None, base_dir)
+
+    with st.sidebar.expander("Model training", expanded=False):
+        if model_state.get("available"):
+            st.caption(f"Runtime model: {model_state.get('model_path')}")
+            metrics = model_state.get("metrics") or {}
+            if metrics:
+                st.caption(
+                    f"Calibration: {metrics.get('calibration_method', 'n/a')} | "
+                    f"Train rows: {metrics.get('train_rows', '--')} | "
+                    f"Test rows: {metrics.get('test_rows', '--')}"
+                )
+        else:
+            st.caption("No active model available. ML scoring will fail closed until a model is trained or loaded.")
+
+        uploaded = st.file_uploader("Training workbook (.xlsx)", type=["xlsx"], key="training_workbook")
+        model_name = st.text_input("Model name", value=st.session_state.get("training_model_name", ""), key="training_model_name")
+        if st.button("Train and activate model", use_container_width=True):
+            if uploaded is None:
+                st.error("Upload a workbook with raw_icu_data or features_4h plus outcomes.")
+            else:
+                fd, temp_path = tempfile.mkstemp(suffix=".xlsx", dir=base_dir)
+                os.close(fd)
+                try:
+                    with open(temp_path, "wb") as f:
+                        f.write(uploaded.getvalue())
+                    result = train_workbook(
+                        temp_path,
+                        config_path=config_path,
+                        base_dir=base_dir,
+                        model_name=model_name or uploaded.name,
+                        activate=True,
+                    )
+                    st.session_state.model_path_override = result["model_path"]
+                    st.session_state.hard_stops_only = False
+                    st.session_state.latest_training_summary = result["summary"]
+                    st.success(f"Model trained and activated: {os.path.basename(result['model_path'])}")
+                except Exception as exc:
+                    st.error(str(exc))
+                finally:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+
+        latest_training = st.session_state.get("latest_training_summary")
+        if latest_training:
+            st.caption(
+                f"Latest training: {latest_training.get('positive_outcomes', 0)} adverse / "
+                f"{latest_training.get('negative_outcomes', 0)} normal encounters"
+            )
+            trend_counts = latest_training.get("trend_label_counts") or {}
+            if trend_counts:
+                st.caption(f"Observed patterns: {trend_counts}")
 
 
 st.set_page_config(page_title="ICU to HDU Step-Down", layout="wide")
@@ -419,13 +518,24 @@ st.title("ICU → HDU Step-Down Readiness")
 st.caption("Decision support only. Conservative, fail-closed.")
 
 cfg = load_config("configs/default.yaml")
-model_path = st.sidebar.text_input("Model path", value="")
-hard_stops_only = st.sidebar.checkbox("Hard-stops only (no ML)", value=not bool(model_path))
+if "model_path_override" not in st.session_state:
+    st.session_state.model_path_override = ""
+if "hard_stops_only" not in st.session_state:
+    st.session_state.hard_stops_only = not bool(resolve_runtime_model_path(st.session_state.model_path_override or None, "database"))
+model_path = st.sidebar.text_input("Model path override", key="model_path_override")
+model_state = runtime_model_status(model_path or None, "database")
+if model_state.get("available"):
+    st.sidebar.caption(f"Using {model_state.get('source')} model: {model_state.get('model_path')}")
+else:
+    st.sidebar.caption("No runtime model available. Scoring will fail closed unless ML is disabled.")
+hard_stops_only = st.sidebar.checkbox("Hard-stops only (no ML)", key="hard_stops_only")
+_render_model_training_sidebar("configs/default.yaml", "database")
 nav = st.sidebar.radio(
     "Navigation",
     ["Operational management", "Ward view", "Clinical readiness assessment"],
     index=2,
 )
+admin_tabs = None
 
 if nav == "Ward view":
     _render_ward_view()
@@ -434,10 +544,88 @@ if nav == "Ward view":
 if nav == "Clinical readiness assessment":
     st.subheader("Patient")
     nhs_number = st.text_input("NHS number", value=st.session_state.get("nhs_number", ""))
+    capacity = get_latest_capacity(OPS_DB_PATH) or {}
+    bed_inventory = get_latest_bed_inventory(OPS_DB_PATH) or {}
+    patient_ops = list_patient_operational_status(OPS_DB_PATH)
+    icu_total, _, free_labels = _icu_bed_state(capacity, bed_inventory, patient_ops)
+
+    existing_encounter = None
+    existing_bed_label = None
+    pseudo_id = None
+    if nhs_number:
+        try:
+            pseudo_id = pseudonymize_nhs(nhs_number, os.path.join("database", "icu_stepdown.sqlite"))
+            db_path = os.path.join("database", pseudo_id, "icu_stepdown.sqlite")
+            if os.path.exists(db_path):
+                existing_encounter = get_latest_encounter(db_path, nhs_number)
+        except Exception:
+            existing_encounter = None
+            pseudo_id = None
+        if existing_encounter:
+            for item in patient_ops:
+                if item.get("encounter_id") == existing_encounter:
+                    existing_bed_label = item.get("bed_label")
+                    break
+
+    bed_label_to_assign = None
+    if not nhs_number:
+        st.text_input("Assigned ICU bed", value="--", disabled=True)
+    else:
+        if existing_encounter:
+            st.text_input("Current ICU bed", value=existing_bed_label or "--", disabled=True)
+        if icu_total == 0:
+            st.info("Set ICU bed count in Operational management → Capacity Setup to enable bed assignment.")
+            st.text_input("Assigned ICU bed", value="--", disabled=True)
+        elif not free_labels:
+            st.warning("No ICU beds free. Discharge a bed or update occupancy to continue.")
+            st.text_input("Assigned ICU bed", value="--", disabled=True)
+        else:
+            bed_label_to_assign = st.selectbox("Assign ICU bed", options=free_labels, index=0)
+            assign_disabled = existing_encounter is None or not bed_label_to_assign
+            if st.button("Assign ICU bed", disabled=assign_disabled):
+                if existing_encounter is None:
+                    st.error("Start the patient first, then assign a bed.")
+                else:
+                    _, _, free_now = _icu_bed_state(
+                        get_latest_capacity(OPS_DB_PATH) or {},
+                        get_latest_bed_inventory(OPS_DB_PATH) or {},
+                        list_patient_operational_status(OPS_DB_PATH),
+                    )
+                    if bed_label_to_assign not in free_now:
+                        st.error("Selected ICU bed is no longer free. Refresh and try again.")
+                        st.stop()
+                    if existing_bed_label == bed_label_to_assign:
+                        st.info(f"Patient is already assigned to {bed_label_to_assign}.")
+                    else:
+                        if not pseudo_id:
+                            st.error("Unable to resolve patient ID for bed assignment.")
+                            st.stop()
+                        if existing_bed_label:
+                            release_bed_assignment(
+                                OPS_DB_PATH,
+                                existing_bed_label,
+                                st.session_state.get("current_user"),
+                            )
+                        upsert_patient_operational_status(
+                            OPS_DB_PATH,
+                            {
+                                "encounter_id": existing_encounter,
+                                "patient_id": pseudo_id,
+                                "bed_label": bed_label_to_assign,
+                            },
+                            st.session_state.get("current_user"),
+                        )
+                        st.success(f"Assigned {bed_label_to_assign} to patient.")
+
+    needs_bed_assignment = bool(nhs_number) and (existing_encounter is None or existing_bed_label is None)
+    start_disabled = needs_bed_assignment and not free_labels
+    new_encounter_disabled = bool(nhs_number) and not free_labels
     col1, col2 = st.columns(2)
-    if col1.button("Start patient"):
+    if col1.button("Start patient", disabled=start_disabled):
         if not nhs_number:
             st.error("Enter NHS number")
+        elif needs_bed_assignment and not bed_label_to_assign:
+            st.error("No ICU beds free to assign.")
         else:
             st.session_state.nhs_number = nhs_number
             pseudo_id = pseudonymize_nhs(nhs_number, os.path.join("database", "icu_stepdown.sqlite"))
@@ -453,11 +641,42 @@ if nav == "Clinical readiness assessment":
             db_path = os.path.join(db_dir, "icu_stepdown.sqlite")
             st.session_state.db_path = db_path
             enc = start_encounter(db_path, nhs_number, force_new=False)
+            if needs_bed_assignment:
+                _, _, free_now = _icu_bed_state(
+                    get_latest_capacity(OPS_DB_PATH) or {},
+                    get_latest_bed_inventory(OPS_DB_PATH) or {},
+                    list_patient_operational_status(OPS_DB_PATH),
+                )
+                if bed_label_to_assign not in free_now:
+                    st.error("Selected ICU bed is no longer free. Refresh and try again.")
+                    st.stop()
+                upsert_patient_operational_status(
+                    OPS_DB_PATH,
+                    {
+                        "encounter_id": enc,
+                        "patient_id": pseudo_id,
+                        "bed_label": bed_label_to_assign,
+                    },
+                    st.session_state.get("current_user"),
+                )
+                if existing_encounter is None:
+                    try:
+                        adjust_bed_inventory(
+                            OPS_DB_PATH,
+                            "ICU",
+                            delta=1,
+                            note=f"Assigned {bed_label_to_assign} to patient {pseudo_id}",
+                            user=st.session_state.get("current_user"),
+                        )
+                    except Exception:
+                        pass
             st.success(f"Using encounter {enc}")
             st.session_state.last_score = _score_from_db(db_path, cfg, model_path or None, hard_stops_only)
-    if col2.button("Start new encounter"):
+    if col2.button("Start new encounter", disabled=new_encounter_disabled):
         if not nhs_number:
             st.error("Enter NHS number")
+        elif not bed_label_to_assign:
+            st.error("No ICU beds free to assign.")
         else:
             st.session_state.nhs_number = nhs_number
             pseudo_id = pseudonymize_nhs(nhs_number, os.path.join("database", "icu_stepdown.sqlite"))
@@ -473,6 +692,33 @@ if nav == "Clinical readiness assessment":
             db_path = os.path.join(db_dir, "icu_stepdown.sqlite")
             st.session_state.db_path = db_path
             enc = start_encounter(db_path, nhs_number, force_new=True)
+            _, _, free_now = _icu_bed_state(
+                get_latest_capacity(OPS_DB_PATH) or {},
+                get_latest_bed_inventory(OPS_DB_PATH) or {},
+                list_patient_operational_status(OPS_DB_PATH),
+            )
+            if bed_label_to_assign not in free_now:
+                st.error("Selected ICU bed is no longer free. Refresh and try again.")
+                st.stop()
+            upsert_patient_operational_status(
+                OPS_DB_PATH,
+                {
+                    "encounter_id": enc,
+                    "patient_id": pseudo_id,
+                    "bed_label": bed_label_to_assign,
+                },
+                st.session_state.get("current_user"),
+            )
+            try:
+                adjust_bed_inventory(
+                    OPS_DB_PATH,
+                    "ICU",
+                    delta=1,
+                    note=f"Assigned {bed_label_to_assign} to patient {pseudo_id}",
+                    user=st.session_state.get("current_user"),
+                )
+            except Exception:
+                pass
             st.success(f"New encounter {enc} started")
             st.session_state.last_score = _score_from_db(db_path, cfg, model_path or None, hard_stops_only)
 
@@ -634,6 +880,7 @@ if nav == "Clinical readiness assessment":
                 st.info("No score yet.")
 
             st.write(f"Recommendation: {dash.get('suggested_action', 'No recommendation available')}")
+            st.write(f"Clinical pattern: {dash.get('trend_label', dash.get('trend', '--'))}")
 
             reasons = dash.get("hard_stop_reason_summary") or ""
             signals = dash.get("signals") or ""
@@ -778,6 +1025,9 @@ if nav == "Clinical readiness assessment":
     if rows:
         st.dataframe(_safe_display_df(pd.DataFrame(rows)))
 
+if nav != "Operational management":
+    st.stop()
+
 if nav == "Operational management":
     st.header("Operational management")
     st.caption("Operational controls influence transfer feasibility, not physiological readiness.")
@@ -791,168 +1041,170 @@ if nav == "Operational management":
         "Audit and Overrides",
     ])
 
-with admin_tabs[0]:
-    latest_capacity = get_latest_capacity(OPS_DB_PATH) or {}
-    with st.form("capacity_form"):
-        col_c1, col_c2, col_c3 = st.columns(3)
-        with col_c1:
-            icu_beds = st.number_input("ICU beds", value=int(latest_capacity.get("icu_beds") or 0), min_value=0, step=1)
-            hdu_beds = st.number_input("HDU beds", value=int(latest_capacity.get("hdu_beds") or 0), min_value=0, step=1)
-            ward_beds = st.number_input("Ward beds", value=int(latest_capacity.get("ward_beds") or 0), min_value=0, step=1)
-        with col_c2:
-            telemetry_beds = st.number_input("Telemetry-capable ward beds", value=int(latest_capacity.get("telemetry_beds") or 0), min_value=0, step=1)
-            isolation_beds = st.number_input("Isolation beds", value=int(latest_capacity.get("isolation_beds") or 0), min_value=0, step=1)
-            surge_beds = st.number_input("Surge beds", value=int(latest_capacity.get("surge_beds") or 0), min_value=0, step=1)
-        with col_c3:
-            shift_label = st.selectbox("Shift", ["Day", "Night"], index=0 if latest_capacity.get("shift_label") != "Night" else 1)
-        submitted = st.form_submit_button("Save capacity")
-        if submitted:
-            save_capacity(
-                OPS_DB_PATH,
-                {
-                    "icu_beds": icu_beds,
-                    "hdu_beds": hdu_beds,
-                    "ward_beds": ward_beds,
-                    "telemetry_beds": telemetry_beds,
-                    "isolation_beds": isolation_beds,
-                    "surge_beds": surge_beds,
-                    "shift_label": shift_label,
-                },
-                st.session_state.get("current_user"),
-            )
-            st.success("Capacity updated.")
-    if latest_capacity:
-        st.caption(f"Last updated: {latest_capacity.get('updated_at')}")
-
-with admin_tabs[1]:
-    latest_staff = get_latest_staffing(OPS_DB_PATH) or {}
-    latest_cap = get_latest_capability(OPS_DB_PATH) or {}
-    with st.form("staffing_form"):
-        col_s1, col_s2, col_s3 = st.columns(3)
-        with col_s1:
-            icu_nurse_available = st.number_input("ICU nurse availability", value=int(latest_staff.get("icu_nurse_available") or 0), min_value=0, step=1)
-            hdu_nurse_available = st.number_input("HDU nurse availability", value=int(latest_staff.get("hdu_nurse_available") or 0), min_value=0, step=1)
-            ward_nurse_available = st.number_input("Ward nurse availability", value=int(latest_staff.get("ward_nurse_available") or 0), min_value=0, step=1)
-        with col_s2:
-            ratio_icu = st.number_input("ICU nurse-to-patient ratio", value=float(latest_staff.get("ratio_icu") or 0), min_value=0.0, step=0.1)
-            ratio_hdu = st.number_input("HDU nurse-to-patient ratio", value=float(latest_staff.get("ratio_hdu") or 0), min_value=0.0, step=0.1)
-            ratio_ward = st.number_input("Ward nurse-to-patient ratio", value=float(latest_staff.get("ratio_ward") or 0), min_value=0.0, step=0.1)
-        with col_s3:
-            cardiac_trained = st.number_input("Cardiac-trained nurses available", value=int(latest_staff.get("cardiac_trained_nurses") or 0), min_value=0, step=1)
-            telemetry_available = st.checkbox("Telemetry monitoring capacity available", value=bool(latest_staff.get("telemetry_available") or 0))
-            outreach_available = st.checkbox("Outreach team available", value=bool(latest_staff.get("outreach_available") or 0))
-            registrar_cover = st.checkbox("Cardiac registrar/resident overnight cover", value=bool(latest_staff.get("registrar_cover_available") or 0))
-            physio_available = st.checkbox("Physiotherapy available today", value=bool(latest_staff.get("physio_available") or 0))
-            resp_available = st.checkbox("Respiratory therapy support", value=bool(latest_staff.get("respiratory_support_available") or 0))
-            dialysis_available = st.checkbox("Dialysis support available", value=bool(latest_staff.get("dialysis_support_available") or 0))
-        shift_label = st.selectbox("Shift label", ["Day", "Night"], index=0 if latest_staff.get("shift_label") != "Night" else 1)
-        notes = st.text_area("Staffing notes", value=latest_staff.get("notes") or "")
-        submitted = st.form_submit_button("Save staffing status")
-        if submitted:
-            save_staffing(
-                OPS_DB_PATH,
-                {
-                    "icu_nurse_available": icu_nurse_available,
-                    "hdu_nurse_available": hdu_nurse_available,
-                    "ward_nurse_available": ward_nurse_available,
-                    "ratio_icu": ratio_icu,
-                    "ratio_hdu": ratio_hdu,
-                    "ratio_ward": ratio_ward,
-                    "cardiac_trained_nurses": cardiac_trained,
-                    "telemetry_available": 1 if telemetry_available else 0,
-                    "outreach_available": 1 if outreach_available else 0,
-                    "registrar_cover_available": 1 if registrar_cover else 0,
-                    "physio_available": 1 if physio_available else 0,
-                    "respiratory_support_available": 1 if resp_available else 0,
-                    "dialysis_support_available": 1 if dialysis_available else 0,
-                    "notes": notes,
-                    "shift_label": shift_label,
-                },
-                st.session_state.get("current_user"),
-            )
-            st.success("Staffing status updated.")
-
-    st.markdown("**Ward capability**")
-    with st.form("capability_form"):
-        can_manage_pacing = st.checkbox("Ward can manage pacing wires", value=bool(latest_cap.get("can_manage_pacing_wires") or 0))
-        can_manage_drains = st.checkbox("Ward can manage chest drains", value=bool(latest_cap.get("can_manage_chest_drains") or 0))
-        can_manage_oxygen = st.checkbox("Ward can manage low-dose oxygen", value=bool(latest_cap.get("can_manage_low_oxygen") or 0))
-        can_manage_insulin = st.checkbox("Ward can manage insulin infusion", value=bool(latest_cap.get("can_manage_insulin_infusion") or 0))
-        telemetry_monitoring = st.checkbox("Telemetry monitoring available on ward", value=bool(latest_cap.get("telemetry_monitoring_available") or 0))
-        notes_cap = st.text_area("Capability notes", value=latest_cap.get("notes") or "")
-        submitted = st.form_submit_button("Save ward capability")
-        if submitted:
-            save_capability(
-                OPS_DB_PATH,
-                {
-                    "can_manage_pacing_wires": 1 if can_manage_pacing else 0,
-                    "can_manage_chest_drains": 1 if can_manage_drains else 0,
-                    "can_manage_low_oxygen": 1 if can_manage_oxygen else 0,
-                    "can_manage_insulin_infusion": 1 if can_manage_insulin else 0,
-                    "telemetry_monitoring_available": 1 if telemetry_monitoring else 0,
-                    "notes": notes_cap,
-                },
-                st.session_state.get("current_user"),
-            )
-            st.success("Ward capability updated.")
-
-with admin_tabs[2]:
-    st.caption("Average ICU/HDU length of stay per procedure group.")
-    los_rows = list_procedure_los(OPS_DB_PATH)
-    los_df = pd.DataFrame(los_rows)
-    if not los_df.empty:
-        los_df = los_df[["procedure_group", "avg_icu_los_hours", "avg_hdu_los_hours", "comments", "last_reviewed"]]
-    edited = _data_editor(_safe_editor_df(los_df), num_rows="dynamic", use_container_width=True)
-    if st.button("Save LOS reference"):
-        save_procedure_los(OPS_DB_PATH, edited.to_dict(orient="records"), st.session_state.get("current_user"))
-        st.success("LOS reference updated.")
-
-with admin_tabs[3]:
-    st.caption("Capture expected incoming demand for the next 24–48 hours.")
-    theatre_rows = list_theatre_schedule(OPS_DB_PATH)
-    theatre_df = pd.DataFrame(theatre_rows)
-    if not theatre_df.empty:
-        theatre_df = theatre_df[["case_date", "procedure_group", "expected_arrival_time", "icu_need", "is_emergency", "notes"]]
-    edited = _data_editor(_safe_editor_df(theatre_df), num_rows="dynamic", use_container_width=True)
-    if st.button("Save theatre schedule"):
-        save_theatre_schedule(OPS_DB_PATH, edited.to_dict(orient="records"), st.session_state.get("current_user"))
-        st.success("Theatre schedule updated.")
-
-with admin_tabs[4]:
-    _render_bed_board(read_only=False)
-
-with admin_tabs[5]:
-    latest_rules = get_latest_rules(OPS_DB_PATH) or {}
-    with st.form("rules_form"):
-        min_telemetry = st.checkbox("Minimum telemetry availability required for certain patients", value=bool(latest_rules.get("min_telemetry_required") or 0))
-        pacing_hdu = st.checkbox("Pacing wires require HDU rather than ward", value=bool(latest_rules.get("pacing_wires_require_hdu") or 0))
-        drains_hdu = st.checkbox("Chest drains require HDU rather than ward", value=bool(latest_rules.get("chest_drains_require_hdu") or 0))
-        ward_o2 = st.number_input("Ward exclusion if FiO2 exceeds", value=float(latest_rules.get("ward_oxygen_fio2_threshold") or 0.4), min_value=0.21, max_value=1.0, step=0.01)
-        ward_vaso = st.checkbox("Ward exclusion if vasoactive support present", value=bool(latest_rules.get("ward_exclusion_vasoactive") or 0))
-        ward_lines = st.checkbox("Ward exclusion if invasive lines remain", value=bool(latest_rules.get("ward_exclusion_invasive_lines") or 0))
-        endocarditis_hdu = st.checkbox("Endocarditis patients default to HDU first", value=bool(latest_rules.get("endocarditis_to_hdu") or 0))
-        notes = st.text_area("Local pathway notes", value=latest_rules.get("notes") or "")
-        submitted = st.form_submit_button("Save rules")
-        if submitted:
-            save_transfer_rules(
-                OPS_DB_PATH,
-                {
-                    "min_telemetry_required": 1 if min_telemetry else 0,
-                    "pacing_wires_require_hdu": 1 if pacing_hdu else 0,
-                    "chest_drains_require_hdu": 1 if drains_hdu else 0,
-                    "ward_oxygen_fio2_threshold": ward_o2,
-                    "ward_exclusion_vasoactive": 1 if ward_vaso else 0,
-                    "ward_exclusion_invasive_lines": 1 if ward_lines else 0,
-                    "endocarditis_to_hdu": 1 if endocarditis_hdu else 0,
-                    "notes": notes,
-                },
-                st.session_state.get("current_user"),
-            )
-            st.success("Rules updated.")
-
-with admin_tabs[6]:
-    audit_rows = list_audit_log(OPS_DB_PATH, limit=200)
-    if audit_rows:
-        st.dataframe(_safe_display_df(pd.DataFrame(audit_rows)))
-    else:
-        st.write("No audit events yet.")
+    if not admin_tabs:
+        st.stop()
+    with admin_tabs[0]:
+        latest_capacity = get_latest_capacity(OPS_DB_PATH) or {}
+        with st.form("capacity_form"):
+            col_c1, col_c2, col_c3 = st.columns(3)
+            with col_c1:
+                icu_beds = st.number_input("ICU beds", value=int(latest_capacity.get("icu_beds") or 0), min_value=0, step=1)
+                hdu_beds = st.number_input("HDU beds", value=int(latest_capacity.get("hdu_beds") or 0), min_value=0, step=1)
+                ward_beds = st.number_input("Ward beds", value=int(latest_capacity.get("ward_beds") or 0), min_value=0, step=1)
+            with col_c2:
+                telemetry_beds = st.number_input("Telemetry-capable ward beds", value=int(latest_capacity.get("telemetry_beds") or 0), min_value=0, step=1)
+                isolation_beds = st.number_input("Isolation beds", value=int(latest_capacity.get("isolation_beds") or 0), min_value=0, step=1)
+                surge_beds = st.number_input("Surge beds", value=int(latest_capacity.get("surge_beds") or 0), min_value=0, step=1)
+            with col_c3:
+                shift_label = st.selectbox("Shift", ["Day", "Night"], index=0 if latest_capacity.get("shift_label") != "Night" else 1)
+            submitted = st.form_submit_button("Save capacity")
+            if submitted:
+                save_capacity(
+                    OPS_DB_PATH,
+                    {
+                        "icu_beds": icu_beds,
+                        "hdu_beds": hdu_beds,
+                        "ward_beds": ward_beds,
+                        "telemetry_beds": telemetry_beds,
+                        "isolation_beds": isolation_beds,
+                        "surge_beds": surge_beds,
+                        "shift_label": shift_label,
+                    },
+                    st.session_state.get("current_user"),
+                )
+                st.success("Capacity updated.")
+        if latest_capacity:
+            st.caption(f"Last updated: {latest_capacity.get('updated_at')}")
+    
+    with admin_tabs[1]:
+        latest_staff = get_latest_staffing(OPS_DB_PATH) or {}
+        latest_cap = get_latest_capability(OPS_DB_PATH) or {}
+        with st.form("staffing_form"):
+            col_s1, col_s2, col_s3 = st.columns(3)
+            with col_s1:
+                icu_nurse_available = st.number_input("ICU nurse availability", value=int(latest_staff.get("icu_nurse_available") or 0), min_value=0, step=1)
+                hdu_nurse_available = st.number_input("HDU nurse availability", value=int(latest_staff.get("hdu_nurse_available") or 0), min_value=0, step=1)
+                ward_nurse_available = st.number_input("Ward nurse availability", value=int(latest_staff.get("ward_nurse_available") or 0), min_value=0, step=1)
+            with col_s2:
+                ratio_icu = st.number_input("ICU nurse-to-patient ratio", value=float(latest_staff.get("ratio_icu") or 0), min_value=0.0, step=0.1)
+                ratio_hdu = st.number_input("HDU nurse-to-patient ratio", value=float(latest_staff.get("ratio_hdu") or 0), min_value=0.0, step=0.1)
+                ratio_ward = st.number_input("Ward nurse-to-patient ratio", value=float(latest_staff.get("ratio_ward") or 0), min_value=0.0, step=0.1)
+            with col_s3:
+                cardiac_trained = st.number_input("Cardiac-trained nurses available", value=int(latest_staff.get("cardiac_trained_nurses") or 0), min_value=0, step=1)
+                telemetry_available = st.checkbox("Telemetry monitoring capacity available", value=bool(latest_staff.get("telemetry_available") or 0))
+                outreach_available = st.checkbox("Outreach team available", value=bool(latest_staff.get("outreach_available") or 0))
+                registrar_cover = st.checkbox("Cardiac registrar/resident overnight cover", value=bool(latest_staff.get("registrar_cover_available") or 0))
+                physio_available = st.checkbox("Physiotherapy available today", value=bool(latest_staff.get("physio_available") or 0))
+                resp_available = st.checkbox("Respiratory therapy support", value=bool(latest_staff.get("respiratory_support_available") or 0))
+                dialysis_available = st.checkbox("Dialysis support available", value=bool(latest_staff.get("dialysis_support_available") or 0))
+            shift_label = st.selectbox("Shift label", ["Day", "Night"], index=0 if latest_staff.get("shift_label") != "Night" else 1)
+            notes = st.text_area("Staffing notes", value=latest_staff.get("notes") or "")
+            submitted = st.form_submit_button("Save staffing status")
+            if submitted:
+                save_staffing(
+                    OPS_DB_PATH,
+                    {
+                        "icu_nurse_available": icu_nurse_available,
+                        "hdu_nurse_available": hdu_nurse_available,
+                        "ward_nurse_available": ward_nurse_available,
+                        "ratio_icu": ratio_icu,
+                        "ratio_hdu": ratio_hdu,
+                        "ratio_ward": ratio_ward,
+                        "cardiac_trained_nurses": cardiac_trained,
+                        "telemetry_available": 1 if telemetry_available else 0,
+                        "outreach_available": 1 if outreach_available else 0,
+                        "registrar_cover_available": 1 if registrar_cover else 0,
+                        "physio_available": 1 if physio_available else 0,
+                        "respiratory_support_available": 1 if resp_available else 0,
+                        "dialysis_support_available": 1 if dialysis_available else 0,
+                        "notes": notes,
+                        "shift_label": shift_label,
+                    },
+                    st.session_state.get("current_user"),
+                )
+                st.success("Staffing status updated.")
+    
+        st.markdown("**Ward capability**")
+        with st.form("capability_form"):
+            can_manage_pacing = st.checkbox("Ward can manage pacing wires", value=bool(latest_cap.get("can_manage_pacing_wires") or 0))
+            can_manage_drains = st.checkbox("Ward can manage chest drains", value=bool(latest_cap.get("can_manage_chest_drains") or 0))
+            can_manage_oxygen = st.checkbox("Ward can manage low-dose oxygen", value=bool(latest_cap.get("can_manage_low_oxygen") or 0))
+            can_manage_insulin = st.checkbox("Ward can manage insulin infusion", value=bool(latest_cap.get("can_manage_insulin_infusion") or 0))
+            telemetry_monitoring = st.checkbox("Telemetry monitoring available on ward", value=bool(latest_cap.get("telemetry_monitoring_available") or 0))
+            notes_cap = st.text_area("Capability notes", value=latest_cap.get("notes") or "")
+            submitted = st.form_submit_button("Save ward capability")
+            if submitted:
+                save_capability(
+                    OPS_DB_PATH,
+                    {
+                        "can_manage_pacing_wires": 1 if can_manage_pacing else 0,
+                        "can_manage_chest_drains": 1 if can_manage_drains else 0,
+                        "can_manage_low_oxygen": 1 if can_manage_oxygen else 0,
+                        "can_manage_insulin_infusion": 1 if can_manage_insulin else 0,
+                        "telemetry_monitoring_available": 1 if telemetry_monitoring else 0,
+                        "notes": notes_cap,
+                    },
+                    st.session_state.get("current_user"),
+                )
+                st.success("Ward capability updated.")
+    
+    with admin_tabs[2]:
+        st.caption("Average ICU/HDU length of stay per procedure group.")
+        los_rows = list_procedure_los(OPS_DB_PATH)
+        los_df = pd.DataFrame(los_rows)
+        if not los_df.empty:
+            los_df = los_df[["procedure_group", "avg_icu_los_hours", "avg_hdu_los_hours", "comments", "last_reviewed"]]
+        edited = _data_editor(_safe_editor_df(los_df), num_rows="dynamic", use_container_width=True)
+        if st.button("Save LOS reference"):
+            save_procedure_los(OPS_DB_PATH, edited.to_dict(orient="records"), st.session_state.get("current_user"))
+            st.success("LOS reference updated.")
+    
+    with admin_tabs[3]:
+        st.caption("Capture expected incoming demand for the next 24–48 hours.")
+        theatre_rows = list_theatre_schedule(OPS_DB_PATH)
+        theatre_df = pd.DataFrame(theatre_rows)
+        if not theatre_df.empty:
+            theatre_df = theatre_df[["case_date", "procedure_group", "expected_arrival_time", "icu_need", "is_emergency", "notes"]]
+        edited = _data_editor(_safe_editor_df(theatre_df), num_rows="dynamic", use_container_width=True)
+        if st.button("Save theatre schedule"):
+            save_theatre_schedule(OPS_DB_PATH, edited.to_dict(orient="records"), st.session_state.get("current_user"))
+            st.success("Theatre schedule updated.")
+    
+    with admin_tabs[4]:
+        _render_bed_board(read_only=False)
+    
+    with admin_tabs[5]:
+        latest_rules = get_latest_rules(OPS_DB_PATH) or {}
+        with st.form("rules_form"):
+            min_telemetry = st.checkbox("Minimum telemetry availability required for certain patients", value=bool(latest_rules.get("min_telemetry_required") or 0))
+            pacing_hdu = st.checkbox("Pacing wires require HDU rather than ward", value=bool(latest_rules.get("pacing_wires_require_hdu") or 0))
+            drains_hdu = st.checkbox("Chest drains require HDU rather than ward", value=bool(latest_rules.get("chest_drains_require_hdu") or 0))
+            ward_o2 = st.number_input("Ward exclusion if FiO2 exceeds", value=float(latest_rules.get("ward_oxygen_fio2_threshold") or 0.4), min_value=0.21, max_value=1.0, step=0.01)
+            ward_vaso = st.checkbox("Ward exclusion if vasoactive support present", value=bool(latest_rules.get("ward_exclusion_vasoactive") or 0))
+            ward_lines = st.checkbox("Ward exclusion if invasive lines remain", value=bool(latest_rules.get("ward_exclusion_invasive_lines") or 0))
+            endocarditis_hdu = st.checkbox("Endocarditis patients default to HDU first", value=bool(latest_rules.get("endocarditis_to_hdu") or 0))
+            notes = st.text_area("Local pathway notes", value=latest_rules.get("notes") or "")
+            submitted = st.form_submit_button("Save rules")
+            if submitted:
+                save_transfer_rules(
+                    OPS_DB_PATH,
+                    {
+                        "min_telemetry_required": 1 if min_telemetry else 0,
+                        "pacing_wires_require_hdu": 1 if pacing_hdu else 0,
+                        "chest_drains_require_hdu": 1 if drains_hdu else 0,
+                        "ward_oxygen_fio2_threshold": ward_o2,
+                        "ward_exclusion_vasoactive": 1 if ward_vaso else 0,
+                        "ward_exclusion_invasive_lines": 1 if ward_lines else 0,
+                        "endocarditis_to_hdu": 1 if endocarditis_hdu else 0,
+                        "notes": notes,
+                    },
+                    st.session_state.get("current_user"),
+                )
+                st.success("Rules updated.")
+    
+    with admin_tabs[6]:
+        audit_rows = list_audit_log(OPS_DB_PATH, limit=200)
+        if audit_rows:
+            st.dataframe(_safe_display_df(pd.DataFrame(audit_rows)))
+        else:
+            st.write("No audit events yet.")

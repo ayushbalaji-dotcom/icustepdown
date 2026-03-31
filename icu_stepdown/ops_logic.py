@@ -149,6 +149,10 @@ def _incoming_pressure_score(ops_db_path: str, window_hours: int = 24) -> float:
             when = datetime.fromisoformat(f"{date_str}T{time_str}")
         except Exception:
             continue
+        if when < now and date_str == now.date().isoformat():
+            rollover = when + timedelta(days=1)
+            if rollover <= now + timedelta(hours=window_hours):
+                when = rollover
         if when < now or when > now + timedelta(hours=window_hours):
             continue
         need = str(row.get("icu_need") or "").lower()

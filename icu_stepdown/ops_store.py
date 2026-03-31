@@ -164,6 +164,7 @@ def init_ops_db(db_path: str) -> None:
                 encounter_id TEXT UNIQUE NOT NULL,
                 patient_id TEXT NOT NULL,
                 procedure_group TEXT,
+                bed_label TEXT,
                 readiness_status TEXT,
                 readiness_score REAL,
                 destination_recommendation TEXT,
@@ -191,6 +192,7 @@ def init_ops_db(db_path: str) -> None:
             """
         )
         _ensure_column(cur, "patient_operational_status", "procedure_group", "TEXT")
+        _ensure_column(cur, "patient_operational_status", "bed_label", "TEXT")
         conn.commit()
     finally:
         conn.close()
@@ -669,7 +671,11 @@ def upsert_patient_operational_status(db_path: str, payload: Dict[str, Any], use
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, first_ready_at, readiness_status, transfer_feasibility, operational_blockers FROM patient_operational_status WHERE encounter_id = ?",
+            """
+            SELECT id, first_ready_at, readiness_status, transfer_feasibility, operational_blockers, bed_label
+            FROM patient_operational_status
+            WHERE encounter_id = ?
+            """,
             (payload.get("encounter_id"),),
         )
         existing = cur.fetchone()
@@ -677,21 +683,28 @@ def upsert_patient_operational_status(db_path: str, payload: Dict[str, Any], use
         prev_status = existing[2] if existing else None
         prev_feas = existing[3] if existing else None
         prev_blockers = existing[4] if existing else None
+        prev_bed_label = existing[5] if existing else None
         readiness_status = payload.get("readiness_status")
         if readiness_status == "GREEN" and not first_ready_at:
             first_ready_at = now
         if readiness_status != "GREEN":
             first_ready_at = None
         blockers_json = json.dumps(payload.get("operational_blockers") or [])
+        bed_label = payload.get("bed_label")
+        if isinstance(bed_label, str) and bed_label.strip() == "":
+            bed_label = None
+        if bed_label is None:
+            bed_label = prev_bed_label
         cur.execute(
             """
             INSERT INTO patient_operational_status
-            (encounter_id, patient_id, procedure_group, readiness_status, readiness_score, destination_recommendation,
+            (encounter_id, patient_id, procedure_group, bed_label, readiness_status, readiness_score, destination_recommendation,
              transfer_feasibility, operational_blockers, bed_priority_score, first_ready_at, last_ready_at, updated_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(encounter_id) DO UPDATE SET
                 patient_id=excluded.patient_id,
                 procedure_group=excluded.procedure_group,
+                bed_label=excluded.bed_label,
                 readiness_status=excluded.readiness_status,
                 readiness_score=excluded.readiness_score,
                 destination_recommendation=excluded.destination_recommendation,
@@ -706,6 +719,7 @@ def upsert_patient_operational_status(db_path: str, payload: Dict[str, Any], use
                 payload.get("encounter_id"),
                 payload.get("patient_id"),
                 payload.get("procedure_group"),
+                bed_label,
                 readiness_status,
                 payload.get("readiness_score"),
                 payload.get("destination_recommendation"),
@@ -755,6 +769,27 @@ def list_patient_operational_status(db_path: str) -> List[Dict[str, Any]]:
         return results
     finally:
         conn.close()
+
+
+def release_bed_assignment(db_path: str, bed_label: str, user: str | None) -> int:
+    if not bed_label:
+        return 0
+    init_ops_db(db_path)
+    now = _utc_now()
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE patient_operational_status SET bed_label = NULL, updated_at = ? WHERE bed_label = ?",
+            (now, bed_label),
+        )
+        conn.commit()
+        affected = cur.rowcount or 0
+    finally:
+        conn.close()
+    if affected:
+        log_audit(db_path, "update", "patient_operational_status", bed_label, f"Released bed {bed_label}", user)
+    return affected
 
 
 def list_audit_log(db_path: str, limit: int = 200) -> List[Dict[str, Any]]:

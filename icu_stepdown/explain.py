@@ -81,12 +81,36 @@ def _signal_templates() -> Dict[str, str]:
     }
 
 
+def _normal_signals(row: pd.Series, cfg: Dict[str, Any]) -> List[str]:
+    signals: List[str] = []
+    if pd.notna(row.get("MAP_time_ge_65")) and row.get("MAP_time_ge_65") >= 0.8:
+        signals.append(f"MAP held >=65 for {row.get('MAP_time_ge_65') * 100:.0f}% of last 4h")
+    elif pd.notna(row.get("MAP_mean_4h")) and row.get("MAP_mean_4h") >= 65:
+        signals.append(f"MAP mean 4h {float(row.get('MAP_mean_4h')):.1f} mmHg")
+
+    spo2_target = float(cfg.get("hard_stops", {}).get("spO2_time_ge_94", 0.8))
+    if pd.notna(row.get("SpO2_time_ge_94")) and row.get("SpO2_time_ge_94") >= spo2_target:
+        signals.append(f"SpO2 maintained >=94% for {row.get('SpO2_time_ge_94') * 100:.0f}% of last 4h")
+
+    if pd.notna(row.get("pressor_on")) and float(row.get("pressor_on")) == 0:
+        signals.append("No vasoactive support running")
+
+    lactate_now_thr = float(cfg.get("hard_stops", {}).get("lactate_now_threshold", 2.0))
+    if pd.notna(row.get("lactate_now")) and row.get("lactate_now") < lactate_now_thr:
+        signals.append(f"Lactate {float(row.get('lactate_now')):.2f}")
+
+    if pd.notna(row.get("FiO2_slope_4h")) and row.get("FiO2_slope_4h") <= 0:
+        signals.append(f"FiO2 stable/improving ({float(row.get('FiO2_slope_4h')):.3f} per hr)")
+
+    return signals[:3]
+
+
 def compute_limiting_factor_and_signals(
     features: pd.DataFrame, model_bundle: Dict[str, Any], cfg: Dict[str, Any]
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     feature_cols = model_bundle["feature_columns"]
-    means = pd.Series(model_bundle["training_means"])
-    X = features[feature_cols].fillna(means)
+    means = pd.Series(model_bundle["training_means"]).fillna(0.0)
+    X = features[feature_cols].fillna(means).fillna(0.0)
     calibrator = model_bundle["calibrator"]
     base = calibrator.predict_proba(X)[:, 1]
 
@@ -124,6 +148,8 @@ def compute_limiting_factor_and_signals(
                         sigs.append(tpl.format(value=float(features.iloc[i][feat])))
                 if len(sigs) >= 3:
                     break
+        else:
+            sigs = _normal_signals(features.iloc[i], cfg)
         if not sigs:
             sigs = ["Insufficient data to explain"]
         signals.append("; ".join(sigs))
@@ -135,5 +161,3 @@ def compute_limiting_factor_and_signals(
     signals_df["signals"] = signals
 
     return signals_df, limiting_df
-
-

@@ -122,8 +122,18 @@ button.ghost {
 .actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
   margin-top: 16px;
+}
+
+.status-block {
+  min-height: 44px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #fff7ed;
+  border: 1px solid #efd8c3;
+  font-weight: 600;
 }
 
 .score-grid {

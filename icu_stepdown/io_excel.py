@@ -3,7 +3,6 @@ import tempfile
 from typing import Dict, Optional
 
 import pandas as pd
-from openpyxl import load_workbook
 
 
 def read_excel_sheets(path: str, sheets: Optional[list] = None) -> Dict[str, pd.DataFrame]:
@@ -23,25 +22,15 @@ def write_excel_preserve(input_path: str, output_path: str, sheets: Dict[str, pd
     fd, temp_path = tempfile.mkstemp(suffix=".xlsx", dir=out_dir)
     os.close(fd)
     try:
-        if os.path.exists(input_path):
-            wb = load_workbook(input_path)
-            with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
-                writer.book = wb
-                for sheet_name, df in sheets.items():
-                    if sheet_name in writer.book.sheetnames:
-                        ws = writer.book[sheet_name]
-                        writer.book.remove(ws)
-                    df.to_excel(writer, sheet_name=sheet_name, index=False)
-                writer.save()
-        else:
-            with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
-                for sheet_name, df in sheets.items():
-                    df.to_excel(writer, sheet_name=sheet_name, index=False)
-                writer.save()
+        all_sheets = read_excel_sheets(input_path) if os.path.exists(input_path) else {}
+        all_sheets.update(sheets)
+        with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
+            for sheet_name, df in all_sheets.items():
+                out_df = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+                out_df.to_excel(writer, sheet_name=sheet_name, index=False)
         os.replace(temp_path, output_path)
     except PermissionError as e:
         if os.path.exists(temp_path):
             os.remove(temp_path)
         raise PermissionError("Output file is locked or not writable") from e
-
 

@@ -26,6 +26,33 @@
         </div>
       </section>
 
+      <section class="panel">
+        <header class="panel-header">
+          <h2>Model training</h2>
+        </header>
+
+        <div class="grid">
+          <div class="card">
+            <h3>Upload workbook</h3>
+            <label>Training workbook (.xlsx)</label>
+            <input id="trainingFile" type="file" accept=".xlsx" />
+            <label>Model name</label>
+            <input id="trainingModelName" type="text" placeholder="Optional model label" />
+          </div>
+
+          <div class="card">
+            <h3>Runtime model</h3>
+            <div id="modelStatus" class="status-block">No model loaded.</div>
+            <p id="modelMetrics" class="muted"></p>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="trainModelBtn">Train and activate model</button>
+          <p id="trainingStatus" class="muted"></p>
+        </div>
+      </section>
+
       <section id="preopSection" class="panel hidden">
         <header class="panel-header">
           <h2>Pre-op characteristics</h2>
@@ -188,7 +215,7 @@
             <div class="traffic" id="trafficLight">RED</div>
             <div class="score-meta">
               <div><span>IRI</span><strong id="iriValue">--</strong></div>
-              <div><span>Trend</span><strong id="trendValue">--</strong></div>
+              <div><span>Clinical pattern</span><strong id="trendValue">--</strong></div>
               <div><span>Limiting factor</span><strong id="limitingValue">--</strong></div>
             </div>
             <div class="signals">

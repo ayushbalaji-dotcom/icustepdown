@@ -10,23 +10,28 @@ EXCEL_EPOCH = "1899-12-30"
 
 
 def _parse_timestamp_series(series: pd.Series, ql: QualityLogger) -> pd.Series:
-    parsed = pd.to_datetime(series, errors="coerce")
-    # Normalize to timezone-naive
-    try:
-        if getattr(parsed.dt, "tz", None) is not None:
-            parsed = parsed.dt.tz_convert(None)
-    except Exception:
-        pass
-    # Handle Excel serial dates for numeric values that failed
-    mask = parsed.isna() & series.notna()
-    if mask.any():
-        numeric = pd.to_numeric(series[mask], errors="coerce")
-        serial_mask = numeric.notna()
-        if serial_mask.any():
-            parsed.loc[mask[mask].index[serial_mask]] = pd.to_datetime(
-                numeric[serial_mask], unit="d", origin=EXCEL_EPOCH, errors="coerce"
-            )
-    return parsed
+    def _parse_one(value: Any):
+        if pd.isna(value):
+            return pd.NaT
+
+        numeric = None
+        is_numeric_cell = isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool)
+        if is_numeric_cell:
+            numeric = float(value)
+            return pd.to_datetime(numeric, unit="D", origin=EXCEL_EPOCH, errors="coerce")
+
+        parsed = pd.to_datetime(value, errors="coerce", utc=True)
+        if pd.isna(parsed):
+            numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+            if pd.notna(numeric):
+                return pd.to_datetime(numeric, unit="D", origin=EXCEL_EPOCH, errors="coerce")
+            return pd.NaT
+        try:
+            return parsed.tz_convert(None)
+        except Exception:
+            return parsed
+
+    return series.apply(_parse_one)
 
 
 def validate_raw(df: pd.DataFrame, cfg: Dict[str, Any], ql: QualityLogger) -> Tuple[pd.DataFrame, bool]:

@@ -1,5 +1,7 @@
+import cgi
 import json
 import os
+import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 from datetime import datetime
@@ -8,11 +10,13 @@ import pandas as pd
 
 from .config import load_config
 from .features import compute_features
+from .model_store import resolve_runtime_model_path, runtime_model_status
 from .patient_store import append_row, load_preop, load_rows, save_preop, start_encounter
 from .preprocess import preprocess
 from .quality import QualityLogger
 from .schema import validate_raw
 from .score import score_features, _fail_closed_dashboard
+from .training_service import train_workbook
 
 
 class StepdownHandler(BaseHTTPRequestHandler):
@@ -100,10 +104,15 @@ class StepdownHandler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             nhs = qs.get("nhs_number", [""])[0]
             return self._handle_score(nhs)
+        if parsed.path == "/api/model-status":
+            return self._handle_model_status()
         self.send_response(404)
         self.end_headers()
 
     def do_POST(self):
+        if self.path == "/api/train":
+            return self._handle_train()
+
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8")
         try:
@@ -170,6 +179,61 @@ class StepdownHandler(BaseHTTPRequestHandler):
             return self._send_json(200, {"status": "no_data"})
         return self._send_json(200, {"status": "ok", "preop": preop})
 
+    def _handle_model_status(self):
+        model_state = runtime_model_status(self.server.model_path, self.server.base_dir)
+        status = "ok" if model_state.get("available") else "no_model"
+        return self._send_json(200, {"status": status, "model": model_state})
+
+    def _handle_train(self):
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            return self._send_json(400, {"error": "expected_multipart_form_data"})
+
+        form = cgi.FieldStorage(
+            fp=self.rfile,
+            headers=self.headers,
+            environ={
+                "REQUEST_METHOD": "POST",
+                "CONTENT_TYPE": content_type,
+                "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
+            },
+        )
+        if "training_file" not in form:
+            return self._send_json(400, {"error": "missing_training_file"})
+
+        file_item = form["training_file"]
+        filename = os.path.basename(getattr(file_item, "filename", "") or "training.xlsx")
+        if not filename.lower().endswith(".xlsx"):
+            return self._send_json(400, {"error": "training_file_must_be_xlsx"})
+        model_name = (form.getfirst("model_name", "") or "").strip() or None
+
+        fd, temp_path = tempfile.mkstemp(suffix=".xlsx", dir=self.server.base_dir)
+        os.close(fd)
+        try:
+            with open(temp_path, "wb") as f:
+                f.write(file_item.file.read())
+            result = train_workbook(
+                temp_path,
+                config_path=self.server.config_path,
+                base_dir=self.server.base_dir,
+                model_name=model_name or os.path.splitext(filename)[0],
+                activate=True,
+            )
+            self.server.model_path = result["model_path"]
+            return self._send_json(
+                200,
+                {
+                    "status": "ok",
+                    "summary": result["summary"],
+                    "model": runtime_model_status(self.server.model_path, self.server.base_dir),
+                },
+            )
+        except Exception as e:
+            return self._send_json(400, {"error": str(e)})
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
     def _handle_score(self, nhs_number: str):
         if not nhs_number:
             return self._send_json(400, {"error": "missing_nhs_number"})
@@ -203,6 +267,8 @@ class StepdownHandler(BaseHTTPRequestHandler):
             return self._send_json(200, {"status": "insufficient_data"})
 
         model_bundle = None
+        model_state = runtime_model_status(self.server.model_path, self.server.base_dir)
+        runtime_model_path = resolve_runtime_model_path(self.server.model_path, self.server.base_dir)
         warning = None
         if self.server.use_baseline:
             from .baseline import build_baseline_bundle
@@ -211,11 +277,11 @@ class StepdownHandler(BaseHTTPRequestHandler):
             scores, _, dashboard, _ = score_features(features, model_bundle, self.server.cfg, ql, force_schema=True)
             warning = "baseline_model_used"
         else:
-            if self.server.model_path and os.path.exists(self.server.model_path):
+            if runtime_model_path and os.path.exists(runtime_model_path):
                 try:
                     from .train import load_model_bundle
 
-                    model_bundle = load_model_bundle(self.server.model_path)
+                    model_bundle = load_model_bundle(runtime_model_path)
                 except Exception:
                     model_bundle = None
             if model_bundle is None:
@@ -239,6 +305,7 @@ class StepdownHandler(BaseHTTPRequestHandler):
             "dashboard": latest,
             "domain_flags": domain,
             "warning": warning,
+            "model_status": model_state,
         })
 
     def log_message(self, format, *args):
@@ -251,6 +318,8 @@ class StepdownServer(HTTPServer):
         super().__init__((host, port), StepdownHandler)
         self.static_dir = static_dir
         self.db_path = db_path
+        self.base_dir = os.path.dirname(os.path.abspath(db_path)) or os.path.abspath("database")
         self.cfg = load_config(config_path)
+        self.config_path = config_path
         self.model_path = model_path
         self.use_baseline = bool(use_baseline)

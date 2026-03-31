@@ -85,7 +85,7 @@ def build_baseline_bundle(features: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[s
     for col in feature_cols:
         if col not in data.columns:
             data[col] = np.nan
-    training_means = data[feature_cols].mean()
+    training_means = data[feature_cols].mean().fillna(0.0)
     return {
         "base_model": None,
         "calibrator": BaselineCalibrator(cfg),
