@@ -67,6 +67,10 @@ from icu_stepdown.score import score_features, _fail_closed_dashboard, score_har
 from icu_stepdown.training_service import train_workbook
 
 
+APP_TITLE = "ICU → HDU Step-Down Readiness"
+APP_CAPTION = "Decision support only. Conservative, fail-closed."
+
+
 def _parse_timestamp(value: str | datetime) -> str:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -562,6 +566,22 @@ def _require_login() -> bool:
     return st.session_state.authenticated
 
 
+def _render_logged_out_landing() -> None:
+    st.title(APP_TITLE)
+    st.caption(APP_CAPTION)
+    st.info("Sign in from the sidebar to open the clinical, operational, and training tools.")
+    col_c, col_o, col_m = st.columns(3)
+    with col_c:
+        st.markdown("**Clinical readiness**")
+        st.write("Capture hourly patient data, calculate readiness, and review deterioration trends.")
+    with col_o:
+        st.markdown("**Operational management**")
+        st.write("Manage ICU, HDU, ward, and local site variables such as ward bay splits.")
+    with col_m:
+        st.markdown("**Model training**")
+        st.write("Upload labelled workbooks to train and activate models that include local clinical variables.")
+
+
 def _score_from_db(db_path: str, cfg, model_path: str | None, hard_stops_only: bool):
     ql = QualityLogger()
     rows = load_rows(db_path, st.session_state.nhs_number)
@@ -680,6 +700,7 @@ def _render_model_training_sidebar(config_path: str, base_dir: str = "database",
 st.set_page_config(page_title="ICU to HDU Step-Down", layout="wide")
 
 if not _require_login():
+    _render_logged_out_landing()
     st.stop()
 
 OPS_DB_PATH = os.path.join("database", "icu_ops.sqlite")
@@ -698,8 +719,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("ICU → HDU Step-Down Readiness")
-st.caption("Decision support only. Conservative, fail-closed.")
+st.title(APP_TITLE)
+st.caption(APP_CAPTION)
 
 cfg = load_config("configs/default.yaml")
 if "model_path_override" not in st.session_state:
