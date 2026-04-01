@@ -956,6 +956,93 @@ def list_patient_operational_status(db_path: str) -> List[Dict[str, Any]]:
         conn.close()
 
 
+def sync_patient_operational_status_from_datastores(db_path: str, data_root: str = "database") -> int:
+    init_ops_db(db_path)
+    root = os.path.abspath(data_root)
+    if not os.path.isdir(root):
+        return 0
+
+    latest_by_patient: Dict[str, Dict[str, str]] = {}
+    for current_root, _, files in os.walk(root):
+        if "icu_stepdown.sqlite" not in files:
+            continue
+        clinical_db_path = os.path.join(current_root, "icu_stepdown.sqlite")
+        try:
+            conn = sqlite3.connect(clinical_db_path)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT
+                    e.encounter_id,
+                    COALESCE(
+                        (SELECT r.patient_id
+                         FROM raw_icu_data r
+                         WHERE r.encounter_id = e.encounter_id
+                         ORDER BY r.timestamp DESC, r.id DESC
+                         LIMIT 1),
+                        (SELECT p.nhs_number FROM patients p WHERE p.id = e.patient_id)
+                    ) AS patient_key,
+                    COALESCE(
+                        (SELECT MAX(r.timestamp) FROM raw_icu_data r WHERE r.encounter_id = e.encounter_id),
+                        e.started_at
+                    ) AS sort_time
+                FROM encounters e
+                WHERE COALESCE(TRIM(e.ended_at), '') = ''
+                """
+            )
+            rows = cur.fetchall()
+        except Exception:
+            rows = []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        for encounter_id, patient_key, sort_time in rows:
+            if not encounter_id or not patient_key:
+                continue
+            patient_key = str(patient_key)
+            sort_key = str(sort_time or "")
+            current = latest_by_patient.get(patient_key)
+            if current is None or sort_key > current["sort_key"]:
+                latest_by_patient[patient_key] = {
+                    "encounter_id": str(encounter_id),
+                    "patient_id": patient_key,
+                    "sort_key": sort_key,
+                }
+
+    if not latest_by_patient:
+        return 0
+
+    now = _utc_now()
+    inserted = 0
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        for item in latest_by_patient.values():
+            cur.execute(
+                "SELECT 1 FROM patient_operational_status WHERE encounter_id = ?",
+                (item["encounter_id"],),
+            )
+            if cur.fetchone():
+                continue
+            cur.execute(
+                """
+                INSERT INTO patient_operational_status
+                (encounter_id, patient_id, updated_at, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (item["encounter_id"], item["patient_id"], now, now),
+            )
+            inserted += 1
+        conn.commit()
+    finally:
+        conn.close()
+
+    return inserted
+
+
 def release_bed_assignment(db_path: str, bed_label: str, user: str | None) -> int:
     if not bed_label:
         return 0

@@ -47,6 +47,7 @@ from icu_stepdown.ops_store import (
     save_procedure_los,
     save_staffing,
     save_theatre_schedule,
+    sync_patient_operational_status_from_datastores,
     save_transfer_rules,
     seed_ops_data,
     upsert_patient_operational_status,
@@ -705,6 +706,7 @@ if not _require_login():
 
 OPS_DB_PATH = os.path.join("database", "icu_ops.sqlite")
 seed_ops_data(OPS_DB_PATH, st.session_state.get("current_user"))
+sync_patient_operational_status_from_datastores(OPS_DB_PATH, "database")
 
 st.markdown(
     """
@@ -1073,6 +1075,10 @@ if nav == "Clinical readiness assessment":
         st.session_state.last_score = result
 
     result = st.session_state.get("last_score")
+    if result is None:
+        result = _score_from_db(st.session_state.db_path, cfg, model_path or None, hard_stops_only)
+        st.session_state.last_score = result
+    
     if result:
         if result["status"] == "insufficient_data":
             st.warning(

@@ -10,13 +10,16 @@ from icu_stepdown.ops_logic import (
 )
 from icu_stepdown.ops_store import (
     adjust_bed_inventory,
+    list_patient_operational_status,
     init_ops_db,
     save_capacity,
     save_bed_inventory,
     save_theatre_schedule,
     get_latest_capacity,
     get_latest_bed_inventory,
+    sync_patient_operational_status_from_datastores,
 )
+from icu_stepdown.patient_store import append_row
 
 
 def test_auth_default_fallback():
@@ -146,3 +149,28 @@ def test_transfer_readiness_separation():
     blockers = ["no ward bed"]
     feasibility = compute_transfer_feasibility(readiness_status, blockers)
     assert feasibility == "No"
+
+
+def test_sync_patient_operational_status_from_datastores(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    clinical_db = data_root / "patient_a" / "icu_stepdown.sqlite"
+    clinical_db.parent.mkdir()
+    append_row(
+        str(clinical_db),
+        "1234567890",
+        {
+            "timestamp": "2025-01-01T08:00:00",
+            "MAP": 75.0,
+        },
+    )
+
+    ops_db = data_root / "icu_ops.sqlite"
+    init_ops_db(str(ops_db))
+    inserted = sync_patient_operational_status_from_datastores(str(ops_db), str(data_root))
+
+    assert inserted == 1
+    rows = list_patient_operational_status(str(ops_db))
+    assert len(rows) == 1
+    assert rows[0]["encounter_id"]
+    assert rows[0]["patient_id"]
