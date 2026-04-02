@@ -50,6 +50,7 @@ from icu_stepdown.ops_store import (
     sync_patient_operational_status_from_datastores,
     save_transfer_rules,
     seed_ops_data,
+    transfer_patient,
     upsert_patient_operational_status,
 )
 from icu_stepdown.patient_store import (
@@ -182,6 +183,57 @@ def _render_bed_board(read_only: bool = False) -> None:
     cap_cols[3].metric("Telemetry beds", latest_capacity.get("telemetry_beds", "--"), f"Free {_free_beds(latest_capacity.get('telemetry_beds'), bed_inventory.get('telemetry_occupied'))}")
     _render_custom_variable_summary(OPS_DB_PATH, "ward", "Ward-specific variables")
 
+    # Interactive patient transfer section
+    if not read_only:
+        st.markdown("**Patient Transfers**")
+        with st.expander("Transfer Patient", expanded=False):
+            transfer_cols = st.columns([2, 2, 2, 1])
+            with transfer_cols[0]:
+                # Get patients currently in ICU or HDU
+                active_patients = [p for p in patients if p.get("current_location") in ["ICU", "HDU"]]
+                patient_options = [""] + [f"{p.get('patient_id')} ({p.get('current_location')})" for p in active_patients]
+                selected_patient = st.selectbox("Select patient to transfer", options=patient_options, key="transfer_patient")
+            
+            if selected_patient and selected_patient != "":
+                patient_id = selected_patient.split(" (")[0]
+                current_patient = next((p for p in active_patients if p.get("patient_id") == patient_id), None)
+                
+                with transfer_cols[1]:
+                    current_loc = current_patient.get("current_location", "ICU") if current_patient else "ICU"
+                    st.write(f"Current: {current_loc}")
+                
+                with transfer_cols[2]:
+                    available_destinations = ["HDU", "Ward", "Telemetry"] if current_loc == "ICU" else ["Ward", "Telemetry"]
+                    new_location = st.selectbox("Transfer to", options=[""] + available_destinations, key="transfer_destination")
+                
+                with transfer_cols[3]:
+                    if st.button("Transfer", key="execute_transfer"):
+                        if current_patient and new_location:
+                            # Find available beds in destination
+                            dest_capacity = latest_capacity.get(f"{new_location.lower()}_beds", 0)
+                            dest_occupied = bed_inventory.get(f"{new_location.lower()}_occupied", 0)
+                            available_beds = max(0, dest_capacity - dest_occupied)
+                            
+                            if available_beds > 0:
+                                # Assign first available bed
+                                new_bed_label = f"{new_location}-{dest_occupied + 1}"
+                                success = transfer_patient(
+                                    OPS_DB_PATH,
+                                    current_patient.get("encounter_id"),
+                                    new_location,
+                                    new_bed_label,
+                                    st.session_state.get("current_user")
+                                )
+                                if success:
+                                    st.success(f"Transferred {patient_id} to {new_location} ({new_bed_label})")
+                                    st.rerun()
+                                else:
+                                    st.error("Transfer failed")
+                            else:
+                                st.error(f"No beds available in {new_location}")
+                        else:
+                            st.error("Please select patient and destination")
+
     if not read_only:
         with st.form("bed_inventory_form"):
             col_b1, col_b2, col_b3, col_b4 = st.columns(4)
@@ -264,85 +316,118 @@ def _render_bed_board(read_only: bool = False) -> None:
 
 
 def _render_ward_view() -> None:
-    st.header("Ward and ICU View")
-    st.caption("Operational visibility only. Readiness remains clinically driven.")
-    _render_bed_board(read_only=True)
-
+    st.header("Patient Flow & Bed Management")
+    st.caption("Interactive bed tracking and patient flow across all areas.")
+    
     patients = list_patient_operational_status(OPS_DB_PATH)
     capacity = get_latest_capacity(OPS_DB_PATH) or {}
-    icu_total = int(capacity.get("icu_beds") or 0)
+    bed_inventory = get_latest_bed_inventory(OPS_DB_PATH) or {}
+    
+    # Create tabs for different views
+    tab1, tab2, tab3, tab4 = st.tabs(["ICU", "HDU", "Ward", "All Patients"])
+    
+    with tab1:
+        _render_area_view("ICU", patients, capacity, bed_inventory)
+    
+    with tab2:
+        _render_area_view("HDU", patients, capacity, bed_inventory)
+    
+    with tab3:
+        _render_area_view("Ward", patients, capacity, bed_inventory)
+    
+    with tab4:
+        _render_all_patients_view(patients)
+
+
+def _render_area_view(area: str, patients: List[Dict], capacity: Dict, bed_inventory: Dict) -> None:
+    """Render bed status for a specific area."""
+    area_patients = [p for p in patients if p.get("current_location") == area]
+    area_capacity = int(capacity.get(f"{area.lower()}_beds") or 0)
+    area_occupied = int(bed_inventory.get(f"{area.lower()}_occupied") or 0)
+    
+    st.subheader(f"{area} Status")
+    col1, col2, col3 = st.columns(3)
+    col1.metric(f"{area} Beds", area_capacity, f"Occupied: {area_occupied}")
+    col2.metric("Free Beds", max(0, area_capacity - area_occupied))
+    col3.metric("Patients", len(area_patients))
+    
+    if area_capacity == 0:
+        st.info(f"Set {area} bed count in Operational management → Capacity Setup to see the bed table.")
+        return
+    
+    # Create bed grid
     bed_rows = []
-    patient_queue = list(patients)
-    for idx in range(max(icu_total, len(patient_queue))):
-        patient = patient_queue[idx] if idx < len(patient_queue) else None
-        bed_label = f"ICU-{idx + 1}" if idx < icu_total else "ICU-Overflow"
-        if not patient:
-            bed_rows.append(
-                {
-                    "Bed": bed_label,
-                    "Patient": "--",
-                    "Readiness": "--",
-                    "Transfer feasibility": "--",
-                    "Status": "Free",
-                    "Waiting reason": "--",
-                }
-            )
-            continue
-        readiness = patient.get("readiness_status") or "--"
-        feasibility = patient.get("transfer_feasibility") or "--"
-        blockers = patient.get("operational_blockers") or []
-        waiting_reason = ", ".join(blockers) if blockers else ("Awaiting ward bed" if feasibility == "No" else "--")
-        if feasibility == "Yes":
-            status = "Clinically ready"
-        elif readiness == "GREEN":
-            status = "Ready but blocked"
-        elif readiness == "AMBER":
-            status = "Borderline"
+    area_patients_dict = {p.get("bed_label"): p for p in area_patients if p.get("bed_label")}
+    
+    for idx in range(1, area_capacity + 1):
+        bed_label = f"{area}-{idx}"
+        patient = area_patients_dict.get(bed_label)
+        
+        if patient:
+            readiness = patient.get("readiness_status") or "--"
+            status = "Occupied"
+            patient_info = patient.get("patient_id") or "--"
         else:
-            status = "Not ready"
-        bed_rows.append(
-            {
-                "Bed": bed_label,
-                "Patient": patient.get("patient_id") or "--",
-                "Readiness": readiness,
-                "Transfer feasibility": feasibility,
-                "Status": status,
-                "Waiting reason": waiting_reason,
-            }
-        )
+            readiness = "--"
+            status = "Free"
+            patient_info = "--"
+        
+        bed_rows.append({
+            "Bed": bed_label,
+            "Patient": patient_info,
+            "Readiness": readiness,
+            "Status": status,
+        })
+    
+    # Add overflow patients
+    overflow_patients = [p for p in area_patients if not p.get("bed_label") or not p.get("bed_label").startswith(f"{area}-")]
+    for patient in overflow_patients:
+        bed_rows.append({
+            "Bed": f"{area}-Overflow",
+            "Patient": patient.get("patient_id") or "--",
+            "Readiness": patient.get("readiness_status") or "--",
+            "Status": "Overflow",
+        })
+    
+    st.dataframe(_safe_display_df(pd.DataFrame(bed_rows)), use_container_width=True, hide_index=True)
 
-    st.subheader("ICU bed status")
-    if icu_total == 0:
-        st.info("Set ICU bed count in Operational management → Capacity Setup to see the bed table.")
-    else:
-        st.dataframe(_safe_display_df(pd.DataFrame(bed_rows)), use_container_width=True, hide_index=True)
 
-    icu_candidates = [p for p in patients if p.get("readiness_status") in {"GREEN", "AMBER"}]
-    ward_candidates = [p for p in patients if p.get("destination_recommendation") == "Ward"]
-    blocked = [p for p in patients if p.get("transfer_feasibility") == "No"]
-
-    col_i, col_w = st.columns(2)
-    with col_i:
-        st.subheader("ICU view")
-        if not icu_candidates:
-            st.write("No step-down candidates yet.")
-        else:
-            for item in icu_candidates:
-                st.write(f"- {item.get('patient_id')} ({item.get('readiness_status')}, {item.get('transfer_feasibility')})")
-    with col_w:
-        st.subheader("Ward view")
-        if not ward_candidates:
-            st.write("No ward-destination candidates yet.")
-        else:
-            for item in ward_candidates:
-                st.write(f"- {item.get('patient_id')} ({item.get('transfer_feasibility')})")
-
-    with st.expander("Operational bottlenecks"):
-        if not blocked:
-            st.write("No active blockers.")
-        else:
-            for item in blocked:
-                st.write(f"- {item.get('patient_id')}: {', '.join(item.get('operational_blockers') or [])}")
+def _render_all_patients_view(patients: List[Dict]) -> None:
+    """Render a comprehensive view of all patients across areas."""
+    st.subheader("All Patients Overview")
+    
+    if not patients:
+        st.info("No patients currently tracked.")
+        return
+    
+    # Group patients by location
+    location_groups = {}
+    for patient in patients:
+        location = patient.get("current_location", "Unknown")
+        if location not in location_groups:
+            location_groups[location] = []
+        location_groups[location].append(patient)
+    
+    # Display summary
+    summary_cols = st.columns(len(location_groups))
+    for i, (location, loc_patients) in enumerate(location_groups.items()):
+        with summary_cols[i]:
+            st.metric(f"{location} Patients", len(loc_patients))
+    
+    # Detailed table
+    patient_rows = []
+    for patient in patients:
+        patient_rows.append({
+            "Patient ID": patient.get("patient_id", "--"),
+            "Location": patient.get("current_location", "Unknown"),
+            "Bed": patient.get("bed_label", "--"),
+            "Readiness": patient.get("readiness_status", "--"),
+            "Destination": patient.get("destination_recommendation", "--"),
+            "Transfer OK": patient.get("transfer_feasibility", "--"),
+            "Priority Score": f"{patient.get('bed_priority_score', 0):.1f}",
+        })
+    
+    st.dataframe(_safe_display_df(pd.DataFrame(patient_rows)), use_container_width=True, hide_index=True)
 
 
 def _legacy_db_dir_candidates(nhs_number: str) -> list[str]:
@@ -1150,6 +1235,7 @@ if nav == "Clinical readiness assessment":
                     "encounter_id": encounter_id,
                     "patient_id": patient_id,
                     "procedure_group": selected_group or None,
+                    "current_location": current_ops.get("current_location", "ICU") if current_ops else "ICU",
                     "readiness_status": current_ops.get("readiness_status") if current_ops else None,
                     "readiness_score": current_ops.get("readiness_score") if current_ops else None,
                     "destination_recommendation": current_ops.get("destination_recommendation") if current_ops else None,

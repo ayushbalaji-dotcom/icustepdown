@@ -211,6 +211,7 @@ def init_ops_db(db_path: str) -> None:
                 patient_id TEXT NOT NULL,
                 procedure_group TEXT,
                 bed_label TEXT,
+                current_location TEXT DEFAULT 'ICU',
                 readiness_status TEXT,
                 readiness_score REAL,
                 destination_recommendation TEXT,
@@ -239,6 +240,7 @@ def init_ops_db(db_path: str) -> None:
         )
         _ensure_column(cur, "patient_operational_status", "procedure_group", "TEXT")
         _ensure_column(cur, "patient_operational_status", "bed_label", "TEXT")
+        _ensure_column(cur, "patient_operational_status", "current_location", "TEXT DEFAULT 'ICU'")
         conn.commit()
     finally:
         conn.close()
@@ -883,13 +885,14 @@ def upsert_patient_operational_status(db_path: str, payload: Dict[str, Any], use
         cur.execute(
             """
             INSERT INTO patient_operational_status
-            (encounter_id, patient_id, procedure_group, bed_label, readiness_status, readiness_score, destination_recommendation,
+            (encounter_id, patient_id, procedure_group, bed_label, current_location, readiness_status, readiness_score, destination_recommendation,
              transfer_feasibility, operational_blockers, bed_priority_score, first_ready_at, last_ready_at, updated_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(encounter_id) DO UPDATE SET
                 patient_id=excluded.patient_id,
                 procedure_group=excluded.procedure_group,
                 bed_label=excluded.bed_label,
+                current_location=excluded.current_location,
                 readiness_status=excluded.readiness_status,
                 readiness_score=excluded.readiness_score,
                 destination_recommendation=excluded.destination_recommendation,
@@ -905,6 +908,7 @@ def upsert_patient_operational_status(db_path: str, payload: Dict[str, Any], use
                 payload.get("patient_id"),
                 payload.get("procedure_group"),
                 bed_label,
+                payload.get("current_location", "ICU"),
                 readiness_status,
                 payload.get("readiness_score"),
                 payload.get("destination_recommendation"),
@@ -933,6 +937,58 @@ def upsert_patient_operational_status(db_path: str, payload: Dict[str, Any], use
             f"Updated patient status: {payload.get('readiness_status')} / {payload.get('transfer_feasibility')}",
             user,
         )
+
+
+def transfer_patient(db_path: str, encounter_id: str, new_location: str, new_bed_label: str | None, user: str | None) -> bool:
+    """Transfer a patient to a new location and optionally assign a new bed."""
+    init_ops_db(db_path)
+    now = _utc_now()
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT current_location, bed_label, patient_id
+            FROM patient_operational_status
+            WHERE encounter_id = ?
+            """,
+            (encounter_id,),
+        )
+        existing = cur.fetchone()
+        if not existing:
+            return False
+        
+        old_location, old_bed_label, patient_id = existing
+        
+        # Update the patient's location and bed
+        cur.execute(
+            """
+            UPDATE patient_operational_status
+            SET current_location = ?, bed_label = ?, updated_at = ?
+            WHERE encounter_id = ?
+            """,
+            (new_location, new_bed_label, now, encounter_id),
+        )
+        
+        # Adjust bed inventory
+        if old_bed_label:
+            adjust_bed_inventory(db_path, old_location, delta=1, note=f"Patient {patient_id} transferred out", user=user)
+        if new_bed_label:
+            adjust_bed_inventory(db_path, new_location, delta=-1, note=f"Patient {patient_id} transferred in", user=user)
+        
+        conn.commit()
+        
+        log_audit(
+            db_path,
+            "patient_transfer",
+            "patient_operational_status",
+            encounter_id,
+            f"Transferred from {old_location} ({old_bed_label or 'no bed'}) to {new_location} ({new_bed_label or 'no bed'})",
+            user,
+        )
+        return True
+    finally:
+        conn.close()
 
 
 def list_patient_operational_status(db_path: str) -> List[Dict[str, Any]]:
